@@ -4,6 +4,9 @@ x-presto-native-worker-cpu: &cpu_worker_base
     service: presto-base-native-worker
   image: presto-native-worker-cpu:${PRESTO_IMAGE_TAG}
   ulimits: {nofile: {soft: 500000, hard: 500000}}
+  # CPU SHM exchange publishes POSIX shared-memory objects that must be
+  # visible to peer worker containers on the same host.
+  ipc: host
   # SYS_NICE is required so that numactl --cpunodebind / --membind work inside
   # the container (needed for NUMA pinning of multi-worker CPU setups).
   cap_add:
@@ -42,6 +45,27 @@ services:
     environment:
       WORKER_ID: {{ worker.id }}
       NUMA_NODE: {{ worker.numa_node }}
+      VELOX_UCX_CPU_EXCHANGE: "1"
+      # Worker N's HTTP port is 100<N>0 (10000, 10010, 10020, ...) per
+      # generate_presto_config.sh. The CPU UCX exchange derives the upstream
+      # UCX listener as HTTP_port+3, matching the cuDF exchange port
+      # convention.
+      VELOX_UCX_CPU_PORT: "{{ 10000 + 10 * worker.id + 3 }}"
+      VELOX_UCX_LOG_LEVEL: "${VELOX_UCX_LOG_LEVEL:-0}"
+      VELOX_UCX_NUM_PROGRESS_THREADS: "${VELOX_UCX_NUM_PROGRESS_THREADS:-4}"
+      VELOX_UCX_CPU_PIPELINE_DEPTH: "${VELOX_UCX_CPU_PIPELINE_DEPTH:-1}"
+      VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER:-256}"
+      VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER:-128}"
+      VELOX_UCX_CPU_SHM: "${VELOX_UCX_CPU_SHM:-1}"
+      VELOX_UCX_CPU_SHM_DIRECT_TX: "${VELOX_UCX_CPU_SHM_DIRECT_TX:-}"
+      VELOX_UCX_CPU_SHM_SLOT_POOL: "${VELOX_UCX_CPU_SHM_SLOT_POOL:-1}"
+      VELOX_UCX_CPU_SHM_SLOT_POOL_INITIAL_SLOTS: "${VELOX_UCX_CPU_SHM_SLOT_POOL_INITIAL_SLOTS:-8}"
+      VELOX_UCX_CPU_SHM_SLOT_POOL_MAX_POOLS: "${VELOX_UCX_CPU_SHM_SLOT_POOL_MAX_POOLS:-5}"
+      VELOX_UCX_CPU_SHM_BROADCAST_SLOT_POOL: "${VELOX_UCX_CPU_SHM_BROADCAST_SLOT_POOL:-}"
+      VELOX_UCX_CPU_SHM_SLOT_BYTES: "${VELOX_UCX_CPU_SHM_SLOT_BYTES:-}"
+      VELOX_UCX_CPU_SHM_SLOT_COUNT: "${VELOX_UCX_CPU_SHM_SLOT_COUNT:-128}"
+      VELOX_UCX_CPU_MAX_PAGE_BYTES: "${VELOX_UCX_CPU_MAX_PAGE_BYTES:-16777216}"
+      VELOX_UCX_CPU_TARGET_ROWS: "${VELOX_UCX_CPU_TARGET_ROWS:-512000}"
       SERVER_START_TIMESTAMP: ${SERVER_START_TIMESTAMP:-}
     volumes:
       - ../../config/generated/cpu/etc_common:/opt/presto-server/etc
@@ -55,6 +79,25 @@ services:
     <<: *cpu_worker_base
     container_name: presto-native-worker-cpu
     environment:
+      VELOX_UCX_CPU_EXCHANGE: "1"
+      # Single-worker container uses HTTP port 10000 (per generated config),
+      # so UCX port = 10000 + 3.
+      VELOX_UCX_CPU_PORT: "10003"
+      VELOX_UCX_LOG_LEVEL: "${VELOX_UCX_LOG_LEVEL:-0}"
+      VELOX_UCX_NUM_PROGRESS_THREADS: "${VELOX_UCX_NUM_PROGRESS_THREADS:-4}"
+      VELOX_UCX_CPU_PIPELINE_DEPTH: "${VELOX_UCX_CPU_PIPELINE_DEPTH:-1}"
+      VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER:-256}"
+      VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER:-128}"
+      VELOX_UCX_CPU_SHM: "${VELOX_UCX_CPU_SHM:-1}"
+      VELOX_UCX_CPU_SHM_DIRECT_TX: "${VELOX_UCX_CPU_SHM_DIRECT_TX:-}"
+      VELOX_UCX_CPU_SHM_SLOT_POOL: "${VELOX_UCX_CPU_SHM_SLOT_POOL:-1}"
+      VELOX_UCX_CPU_SHM_SLOT_POOL_INITIAL_SLOTS: "${VELOX_UCX_CPU_SHM_SLOT_POOL_INITIAL_SLOTS:-8}"
+      VELOX_UCX_CPU_SHM_SLOT_POOL_MAX_POOLS: "${VELOX_UCX_CPU_SHM_SLOT_POOL_MAX_POOLS:-5}"
+      VELOX_UCX_CPU_SHM_BROADCAST_SLOT_POOL: "${VELOX_UCX_CPU_SHM_BROADCAST_SLOT_POOL:-}"
+      VELOX_UCX_CPU_SHM_SLOT_BYTES: "${VELOX_UCX_CPU_SHM_SLOT_BYTES:-}"
+      VELOX_UCX_CPU_SHM_SLOT_COUNT: "${VELOX_UCX_CPU_SHM_SLOT_COUNT:-128}"
+      VELOX_UCX_CPU_MAX_PAGE_BYTES: "${VELOX_UCX_CPU_MAX_PAGE_BYTES:-16777216}"
+      VELOX_UCX_CPU_TARGET_ROWS: "${VELOX_UCX_CPU_TARGET_ROWS:-512000}"
       SERVER_START_TIMESTAMP: ${SERVER_START_TIMESTAMP:-}
     volumes:
       - ../../config/generated/cpu/etc_common:/opt/presto-server/etc

@@ -74,6 +74,20 @@ def _get_scale_factor_from_schema(hostname: str, port: int, user: str, schema_na
                 pass
 
 
+def _parse_scale_factor(scale_factor: str | None) -> int | float | None:
+    if scale_factor is None:
+        return None
+    try:
+        value = float(scale_factor)
+    except (TypeError, ValueError):
+        _debug(
+            f"invalid explicit scale factor {scale_factor!r}, "
+            "falling back to schema lookup"
+        )
+        return None
+    return int(value) if value == int(value) else value
+
+
 def _find_worker_log(worker_id: int = 0) -> Path | None:
     """Locate the worker log file for *worker_id*.
 
@@ -214,14 +228,18 @@ def gather_run_context(
     port: int,
     user: str,
     schema_name: str,
+    scale_factor: str | None = None,
 ) -> dict:
     """
     Build run-config dict from context. Engine is determined from the
-    coordinator's cluster-tag (via /v1/cluster). Scale factor is read
-    from the metadata file next to the schema's table data.
+    coordinator's cluster-tag (via /v1/cluster). Scale factor comes from
+    the explicit benchmark option when provided, otherwise from the
+    metadata file next to the schema's table data.
     """
     ctx = {}
-    sf = _get_scale_factor_from_schema(hostname, port, user, schema_name)
+    sf = _parse_scale_factor(scale_factor)
+    if sf is None:
+        sf = _get_scale_factor_from_schema(hostname, port, user, schema_name)
     if sf is not None:
         ctx["scale_factor"] = int(sf) if isinstance(sf, float) and sf == int(sf) else sf
 
