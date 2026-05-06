@@ -4,13 +4,16 @@ x-presto-native-worker-cpu: &cpu_worker_base
     service: presto-base-native-worker
   image: presto-native-worker-cpu:${PRESTO_IMAGE_TAG}
   ulimits: {nofile: {soft: 500000, hard: 500000}}
-  # CPU SHM exchange publishes POSIX shared-memory objects that must be
-  # visible to peer worker containers on the same host.
+  # UCX same-host transports may use shared-memory IPC namespaces.
   ipc: host
+  # Let UCX same-host transports that validate peer PIDs, e.g. CMA and POSIX
+  # proc-fd sharing, see a common PID namespace during transport experiments.
+  pid: host
   # SYS_NICE is required so that numactl --cpunodebind / --membind work inside
   # the container (needed for NUMA pinning of multi-worker CPU setups).
   cap_add:
     - SYS_NICE
+    - SYS_PTRACE
   build:
     args:
       - GPU=OFF
@@ -46,6 +49,15 @@ services:
       WORKER_ID: {{ worker.id }}
       NUMA_NODE: {{ worker.numa_node }}
       VELOX_UCX_CPU_EXCHANGE: "1"
+      # Let UCX select the best available transport. Same-host CPU data
+      # endpoints disable endpoint error handling below so UCX can choose SHM;
+      # cross-host endpoints keep error handling and use the best safe transport
+      # UCX can select from this set. Override to constrain experiments.
+      UCX_TLS: "${UCX_TLS:-all}"
+      UCX_LOG_LEVEL: "${UCX_LOG_LEVEL:-warn}"
+      UCX_PROTO_INFO: "${UCX_PROTO_INFO:-n}"
+      UCX_NET_DEVICES: "${UCX_NET_DEVICES:-all}"
+      UCX_POSIX_USE_PROC_LINK: "${UCX_POSIX_USE_PROC_LINK:-y}"
       # Worker N's HTTP port is 100<N>0 (10000, 10010, 10020, ...) per
       # generate_presto_config.sh. The CPU UCX exchange derives the upstream
       # UCX listener as HTTP_port+3, matching the cuDF exchange port
@@ -53,17 +65,17 @@ services:
       VELOX_UCX_CPU_PORT: "{{ 10000 + 10 * worker.id + 3 }}"
       VELOX_UCX_LOG_LEVEL: "${VELOX_UCX_LOG_LEVEL:-0}"
       VELOX_UCX_NUM_PROGRESS_THREADS: "${VELOX_UCX_NUM_PROGRESS_THREADS:-4}"
+      # Optional override for the same-host transport fingerprint. If unset,
+      # the worker hashes /proc/sys/kernel/random/boot_id plus IPC/PID
+      # namespace identities.
+      VELOX_UCX_CPU_HOST_ID: "${VELOX_UCX_CPU_HOST_ID:-}"
+      # 1 enables UCX endpoint error handling for cross-host CPU data
+      # endpoints. Same-host CPU worker-address endpoints disable it
+      # automatically so UCX can select posix/sysv/cma.
+      VELOX_UCX_CPU_ERROR_HANDLING: "${VELOX_UCX_CPU_ERROR_HANDLING:-1}"
       VELOX_UCX_CPU_PIPELINE_DEPTH: "${VELOX_UCX_CPU_PIPELINE_DEPTH:-1}"
       VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER:-256}"
       VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER:-128}"
-      VELOX_UCX_CPU_SHM: "${VELOX_UCX_CPU_SHM:-1}"
-      VELOX_UCX_CPU_SHM_DIRECT_TX: "${VELOX_UCX_CPU_SHM_DIRECT_TX:-}"
-      VELOX_UCX_CPU_SHM_SLOT_POOL: "${VELOX_UCX_CPU_SHM_SLOT_POOL:-1}"
-      VELOX_UCX_CPU_SHM_SLOT_POOL_INITIAL_SLOTS: "${VELOX_UCX_CPU_SHM_SLOT_POOL_INITIAL_SLOTS:-8}"
-      VELOX_UCX_CPU_SHM_SLOT_POOL_MAX_POOLS: "${VELOX_UCX_CPU_SHM_SLOT_POOL_MAX_POOLS:-5}"
-      VELOX_UCX_CPU_SHM_BROADCAST_SLOT_POOL: "${VELOX_UCX_CPU_SHM_BROADCAST_SLOT_POOL:-}"
-      VELOX_UCX_CPU_SHM_SLOT_BYTES: "${VELOX_UCX_CPU_SHM_SLOT_BYTES:-}"
-      VELOX_UCX_CPU_SHM_SLOT_COUNT: "${VELOX_UCX_CPU_SHM_SLOT_COUNT:-128}"
       VELOX_UCX_CPU_MAX_PAGE_BYTES: "${VELOX_UCX_CPU_MAX_PAGE_BYTES:-16777216}"
       VELOX_UCX_CPU_TARGET_ROWS: "${VELOX_UCX_CPU_TARGET_ROWS:-512000}"
       SERVER_START_TIMESTAMP: ${SERVER_START_TIMESTAMP:-}
@@ -80,22 +92,31 @@ services:
     container_name: presto-native-worker-cpu
     environment:
       VELOX_UCX_CPU_EXCHANGE: "1"
+      # Let UCX select the best available transport. Same-host CPU data
+      # endpoints disable endpoint error handling below so UCX can choose SHM;
+      # cross-host endpoints keep error handling and use the best safe transport
+      # UCX can select from this set. Override to constrain experiments.
+      UCX_TLS: "${UCX_TLS:-all}"
+      UCX_LOG_LEVEL: "${UCX_LOG_LEVEL:-warn}"
+      UCX_PROTO_INFO: "${UCX_PROTO_INFO:-n}"
+      UCX_NET_DEVICES: "${UCX_NET_DEVICES:-all}"
+      UCX_POSIX_USE_PROC_LINK: "${UCX_POSIX_USE_PROC_LINK:-y}"
       # Single-worker container uses HTTP port 10000 (per generated config),
       # so UCX port = 10000 + 3.
       VELOX_UCX_CPU_PORT: "10003"
       VELOX_UCX_LOG_LEVEL: "${VELOX_UCX_LOG_LEVEL:-0}"
       VELOX_UCX_NUM_PROGRESS_THREADS: "${VELOX_UCX_NUM_PROGRESS_THREADS:-4}"
+      # Optional override for the same-host transport fingerprint. If unset,
+      # the worker hashes /proc/sys/kernel/random/boot_id plus IPC/PID
+      # namespace identities.
+      VELOX_UCX_CPU_HOST_ID: "${VELOX_UCX_CPU_HOST_ID:-}"
+      # 1 enables UCX endpoint error handling for cross-host CPU data
+      # endpoints. Same-host CPU worker-address endpoints disable it
+      # automatically so UCX can select posix/sysv/cma.
+      VELOX_UCX_CPU_ERROR_HANDLING: "${VELOX_UCX_CPU_ERROR_HANDLING:-1}"
       VELOX_UCX_CPU_PIPELINE_DEPTH: "${VELOX_UCX_CPU_PIPELINE_DEPTH:-1}"
       VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER:-256}"
       VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER:-128}"
-      VELOX_UCX_CPU_SHM: "${VELOX_UCX_CPU_SHM:-1}"
-      VELOX_UCX_CPU_SHM_DIRECT_TX: "${VELOX_UCX_CPU_SHM_DIRECT_TX:-}"
-      VELOX_UCX_CPU_SHM_SLOT_POOL: "${VELOX_UCX_CPU_SHM_SLOT_POOL:-1}"
-      VELOX_UCX_CPU_SHM_SLOT_POOL_INITIAL_SLOTS: "${VELOX_UCX_CPU_SHM_SLOT_POOL_INITIAL_SLOTS:-8}"
-      VELOX_UCX_CPU_SHM_SLOT_POOL_MAX_POOLS: "${VELOX_UCX_CPU_SHM_SLOT_POOL_MAX_POOLS:-5}"
-      VELOX_UCX_CPU_SHM_BROADCAST_SLOT_POOL: "${VELOX_UCX_CPU_SHM_BROADCAST_SLOT_POOL:-}"
-      VELOX_UCX_CPU_SHM_SLOT_BYTES: "${VELOX_UCX_CPU_SHM_SLOT_BYTES:-}"
-      VELOX_UCX_CPU_SHM_SLOT_COUNT: "${VELOX_UCX_CPU_SHM_SLOT_COUNT:-128}"
       VELOX_UCX_CPU_MAX_PAGE_BYTES: "${VELOX_UCX_CPU_MAX_PAGE_BYTES:-16777216}"
       VELOX_UCX_CPU_TARGET_ROWS: "${VELOX_UCX_CPU_TARGET_ROWS:-512000}"
       SERVER_START_TIMESTAMP: ${SERVER_START_TIMESTAMP:-}
