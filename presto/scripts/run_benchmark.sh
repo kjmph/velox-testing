@@ -27,7 +27,7 @@ OPTIONS:
     -q, --queries           Set of benchmark queries to run. This should be a comma separate list of query numbers.
                             By default, all benchmark queries are run.
     --queries-file          Path to a custom JSON file containing query definitions. When specified, queries are loaded
-                            from this file instead of the default queries_best.json.
+                            from this file instead of the canonical common/testing/queries/<benchmark>/queries.json.
     -H, --hostname          Hostname of the Presto coordinator.
     --port                  Port number of the Presto coordinator.
     -u, --user              User who queries will be executed as.

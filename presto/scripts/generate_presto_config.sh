@@ -267,11 +267,25 @@ if [[ "${VARIANT_TYPE}" == "cpu" ]]; then
   fi
   # ~30% of the worker's memory envelope reserved for the Velox async data cache
   : "${CPU_QUERY_MEM_GB:=$(( CPU_SYSTEM_MEM_GB * 70 / 100 ))}"
+  # Number of pages in Velox's largest mmap allocator size class. Velox
+  # requires this to be a power of two and at least 256 pages.
+  # This is a page count, not bytes: 256 pages = 1MB with 4KB pages.
+  : "${CPU_LARGEST_SIZE_CLASS_PAGES:=256}"
+  # Keep table-scan shuffle disabled by default. ALWAYS_ENABLED added too much
+  # exchange traffic for Q21; COST_BASED was effectively neutral in the warm run.
+  : "${CPU_TABLE_SCAN_SHUFFLE_STRATEGY:=DISABLED}"
+  # Native workers run many drivers inside each task. Scheduling source splits
+  # by task load gives the coordinator a finer signal than node-level load and
+  # may reduce long-tail split assignment for Q21-style plans.
+  : "${CPU_SCHEDULE_SPLITS_BASED_ON_TASK_LOAD:=true}"
+  : "${CPU_MAX_SPLITS_PER_TASK:=512}"
   CPU_SYSTEM_MEM_LIMIT_GB=$(( CPU_SYSTEM_MEM_GB + 30 ))
 
   echo "CPU auto-tune: NUM_WORKERS=${NUM_WORKERS:-1} NPROC=${NPROC} NUMA_NODES=${NUMA_NODES} PHYSICAL_CORES=${PHYSICAL_CORES} SMT_RATIO=${SMT_RATIO}"
   echo "               system-memory-gb=${CPU_SYSTEM_MEM_GB} query-memory-gb=${CPU_QUERY_MEM_GB} task.max-drivers-per-task=${CPU_DRIVERS} async-data-cache-enabled=${CPU_ASYNC_DATA_CACHE}"
-  echo "               exchange.max-buffer-size=${CPU_EXCHANGE_BUFFER} sink.max-buffer-size=${CPU_SINK_BUFFER}"
+  echo "               exchange.max-buffer-size=${CPU_EXCHANGE_BUFFER} sink.max-buffer-size=${CPU_SINK_BUFFER} largest-size-class-pages=${CPU_LARGEST_SIZE_CLASS_PAGES}"
+  echo "               optimizer.table-scan-shuffle-strategy=${CPU_TABLE_SCAN_SHUFFLE_STRATEGY}"
+  echo "               node-scheduler.schedule-splits-based-on-task-load=${CPU_SCHEDULE_SPLITS_BASED_ON_TASK_LOAD} node-scheduler.max-splits-per-task=${CPU_MAX_SPLITS_PER_TASK}"
 
   # set_or_append <key> <value> <file>: idempotent — replaces existing
   # `key=...` line if present, otherwise appends. Used here because the
@@ -287,6 +301,18 @@ if [[ "${VARIANT_TYPE}" == "cpu" ]]; then
     fi
   }
 
+  set_or_append \
+    "optimizer.table-scan-shuffle-strategy" \
+    "${CPU_TABLE_SCAN_SHUFFLE_STRATEGY}" \
+    "${CONFIG_DIR}/etc_coordinator/config_native.properties"
+  set_or_append \
+    "node-scheduler.schedule-splits-based-on-task-load" \
+    "${CPU_SCHEDULE_SPLITS_BASED_ON_TASK_LOAD}" \
+    "${CONFIG_DIR}/etc_coordinator/config_native.properties"
+  set_or_append \
+    "node-scheduler.max-splits-per-task" \
+    "${CPU_MAX_SPLITS_PER_TASK}" \
+    "${CONFIG_DIR}/etc_coordinator/config_native.properties"
   # Apply to every CPU worker config dir: etc_worker (single-worker + template
   # for duplicate_worker_configs) plus etc_worker_<N> (multi-worker instances).
   for worker_dir in "${CONFIG_DIR}"/etc_worker*/; do
@@ -298,8 +324,11 @@ if [[ "${VARIANT_TYPE}" == "cpu" ]]; then
     sed -i "s|^query.max-memory-per-node=.*|query.max-memory-per-node=${CPU_QUERY_MEM_GB}GB|" "$cfg"
     sed -i "s/^task.max-drivers-per-task=.*/task.max-drivers-per-task=${CPU_DRIVERS}/" "$cfg"
     sed -i "s/^async-data-cache-enabled=.*/async-data-cache-enabled=${CPU_ASYNC_DATA_CACHE}/" "$cfg"
+    sed -i "/^query.execution-policy=/d" "$cfg"
+    set_or_append "local-exchange.max-buffer-size" "536870912" "$cfg"
     set_or_append "exchange.max-buffer-size" "${CPU_EXCHANGE_BUFFER}" "$cfg"
     set_or_append "sink.max-buffer-size" "${CPU_SINK_BUFFER}" "$cfg"
+    set_or_append "largest-size-class-pages" "${CPU_LARGEST_SIZE_CLASS_PAGES}" "$cfg"
   done
 
   # hive.file-splittable flip for CPU. Put outside the regen gate so restarts
