@@ -16,6 +16,20 @@ from .metrics_collector import collect_metrics
 from .run_context import gather_run_context
 
 
+def session_properties_from_config(config):
+    properties = {}
+    for item in config.getoption("--session-property") or []:
+        if "=" not in item:
+            pytest.exit(f"--session-property must be key=value, got {item!r}", returncode=1)
+        key, value = item.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            pytest.exit(f"--session-property must have a non-empty key, got {item!r}", returncode=1)
+        properties[key] = value
+    return properties
+
+
 @pytest.fixture(scope="session", autouse=True)
 def run_context_collector(request):
     """Gather Presto-specific run context and attach it to the session.
@@ -36,6 +50,9 @@ def run_context_collector(request):
         schema_name=schema_name,
         scale_factor=scale_factor,
     )
+    session_properties = session_properties_from_config(request.config)
+    if session_properties:
+        ctx["session_properties"] = session_properties
     ctx["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     yield ctx
     request.session.run_context = ctx
@@ -68,7 +85,15 @@ def presto_cursor(request):
     port = request.config.getoption("--port")
     user = request.config.getoption("--user")
     schema = request.config.getoption("--schema-name")
-    conn = prestodb.dbapi.connect(host=hostname, port=port, user=user, catalog="hive", schema=schema)
+    session_properties = session_properties_from_config(request.config)
+    conn = prestodb.dbapi.connect(
+        host=hostname,
+        port=port,
+        user=user,
+        catalog="hive",
+        schema=schema,
+        session_properties=session_properties,
+    )
     return conn.cursor()
 
 

@@ -12,6 +12,14 @@ export PROFILE PROFILE_ARGS
 # Compute the directory where this script resides
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+docker_compose_tty() {
+  if [ -t 2 ] && [ ! -t 1 ]; then
+    docker compose "$@" 1>&2
+  else
+    docker compose "$@"
+  fi
+}
+
 if [ -z "${PRESTO_IMAGE_TAG}" ]; then
   export PRESTO_IMAGE_TAG="${USER:-latest}"
 fi
@@ -36,7 +44,7 @@ case "$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -m1 '^presto-nativ
 esac
 
 if [ -n "$ACTIVE" ] && [ -f "$ACTIVE" ]; then
-  docker compose -f "$ACTIVE" down
+  docker_compose_tty -f "$ACTIVE" down
 fi
 
 # Safety net: force-remove any lingering presto-* containers. `docker

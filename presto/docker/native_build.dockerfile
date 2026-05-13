@@ -26,6 +26,8 @@ ARG SCCACHE_VERSION=latest
 ARG SCCACHE_RECACHE
 ARG SCCACHE_NO_CACHE
 ARG SCCACHE_NO_DIST_COMPILE
+ARG VELOX_TESTING_SOURCE_HASH=unknown
+ARG NATIVE_BUILD_CACHE_SCOPE=default
 
 # Override ARM_BUILD_TARGET to prevent get_cxx_flags() in Velox's
 # setup-helper-functions.sh from reading the MIDR_EL1 register and emitting
@@ -64,7 +66,7 @@ RUN mkdir /runtime-libraries
 RUN \
     --mount=type=bind,source=presto/presto-native-execution,target=/presto_native_staging/presto \
     --mount=type=bind,source=velox,target=/presto_native_staging/presto/velox \
-    --mount=type=cache,target=${BUILD_BASE_DIR} \
+    --mount=type=cache,id=presto-native-build-${NATIVE_BUILD_CACHE_SCOPE}-${TARGETARCH}-${BUILD_TYPE}-gpu-${GPU},target=${BUILD_BASE_DIR},sharing=locked \
     --mount=type=cache,target=/root/.cache/sccache/preprocessor \
     --mount=type=cache,target=/root/.cache/sccache-dist-client \
     --mount=type=secret,id=github_token,env=SCCACHE_DIST_AUTH_TOKEN \
@@ -75,6 +77,8 @@ set -euxo pipefail;
 
 source /opt/rh/gcc-toolset-14/enable;
 export CC=/opt/rh/gcc-toolset-14/root/bin/gcc CXX=/opt/rh/gcc-toolset-14/root/bin/g++;
+echo "VELOX_TESTING_SOURCE_HASH=${VELOX_TESTING_SOURCE_HASH}";
+printf '%s\n' "${VELOX_TESTING_SOURCE_HASH}" > "${BUILD_BASE_DIR}/.velox_testing_source_hash";
 
 # Clear stale CMake cache if the compiler changed
 if [ -f "${BUILD_BASE_DIR}/CMakeCache.txt" ]; then

@@ -1,6 +1,7 @@
-# python virtual environment
-.venv
-.*_venv
+# Python virtual environments
+**/.venv/
+**/.venv-*/
+**/*_venv/
 
 # jetbrains IDE folder
 .idea
