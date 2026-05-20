@@ -80,7 +80,7 @@ services:
       # convention.
       VELOX_UCX_CPU_PORT: "{{ 10000 + 10 * worker.id + 3 }}"
       VELOX_UCX_LOG_LEVEL: "${VELOX_UCX_LOG_LEVEL:-0}"
-      VELOX_UCX_NUM_PROGRESS_THREADS: "${VELOX_UCX_NUM_PROGRESS_THREADS:-4}"
+      VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN: "${VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN:-64}"
       # Optional override for the same-host transport fingerprint. If unset,
       # the worker hashes /proc/sys/kernel/random/boot_id plus IPC/PID
       # namespace identities.
@@ -135,7 +135,7 @@ services:
       # so UCX port = 10000 + 3.
       VELOX_UCX_CPU_PORT: "10003"
       VELOX_UCX_LOG_LEVEL: "${VELOX_UCX_LOG_LEVEL:-0}"
-      VELOX_UCX_NUM_PROGRESS_THREADS: "${VELOX_UCX_NUM_PROGRESS_THREADS:-4}"
+      VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN: "${VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN:-64}"
       # Optional override for the same-host transport fingerprint. If unset,
       # the worker hashes /proc/sys/kernel/random/boot_id plus IPC/PID
       # namespace identities.

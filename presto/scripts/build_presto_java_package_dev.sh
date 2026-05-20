@@ -132,7 +132,11 @@ if [[ "$DEV_PRESTO_DEPENDENCIES" == true && -z "$DEV_MAVEN_PROJECTS" ]]; then
   DEV_MAVEN_PROJECTS="$DEV_PRESTO_DEPENDENCIES_PROJECTS"
 fi
 
-MAVEN_CACHE_DIR="${PRESTO_DEV_MAVEN_CACHE_DIR:-${SCRIPT_DIR}/.mvn_cache}"
+DEFAULT_MAVEN_CACHE_DIR="${SCRIPT_DIR}/.mvn_cache"
+if [[ -d "${HOME}/.m2/repository" ]]; then
+  DEFAULT_MAVEN_CACHE_DIR="${HOME}/.m2"
+fi
+MAVEN_CACHE_DIR="${PRESTO_DEV_MAVEN_CACHE_DIR:-${DEFAULT_MAVEN_CACHE_DIR}}"
 mkdir -p "$MAVEN_CACHE_DIR"
 
 image_missing() {
@@ -216,6 +220,17 @@ docker run --rm \
     cp presto-function-server/target/presto-function-server-*executable.jar docker/presto-function-server-executable.jar
     cp presto-function-server/target/presto-function-server-*executable.jar "docker/presto-function-server-${PRESTO_VERSION}-executable.jar"
     cp presto-cli/target/presto-cli-*-executable.jar "docker/presto-cli-${PRESTO_VERSION}-executable.jar"
-    chmod +r "docker/presto-cli-${PRESTO_VERSION}-executable.jar"
+
+    artifact_owner="$(stat -c "%u:%g" docker)"
+    chown "${artifact_owner}" \
+      "docker/presto-server-${PRESTO_VERSION}.tar.gz" \
+      docker/presto-function-server-executable.jar \
+      "docker/presto-function-server-${PRESTO_VERSION}-executable.jar" \
+      "docker/presto-cli-${PRESTO_VERSION}-executable.jar"
+    chmod u+rw,go+r \
+      "docker/presto-server-${PRESTO_VERSION}.tar.gz" \
+      docker/presto-function-server-executable.jar \
+      "docker/presto-function-server-${PRESTO_VERSION}-executable.jar" \
+      "docker/presto-cli-${PRESTO_VERSION}-executable.jar"
     echo "Build complete. Artifacts copied with version ${PRESTO_VERSION}."
   '

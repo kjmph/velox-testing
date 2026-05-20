@@ -99,6 +99,10 @@ if [ "$ENABLE_SCCACHE" = "ON" ]; then
   export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:+$NVCC_APPEND_FLAGS }-t=100";
 fi
 
+if [ -d /presto_native_staging/ucxx/cpp ]; then
+  EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DFETCHCONTENT_SOURCE_DIR_UCXX=/presto_native_staging/ucxx";
+fi
+
 make --directory="/presto_native_staging/presto" cmake-and-build BUILD_TYPE=${BUILD_TYPE} BUILD_DIR="" BUILD_BASE_DIR=${BUILD_BASE_DIR};
 
 if [ "$ENABLE_SCCACHE" = "ON" ]; then

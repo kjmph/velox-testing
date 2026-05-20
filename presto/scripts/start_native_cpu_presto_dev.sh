@@ -371,6 +371,7 @@ function apply_dev_discovery_tuning() {
   local failure_heartbeat="${PRESTO_DEV_FAILURE_DETECTOR_HEARTBEAT:-250ms}"
   local failure_warmup="${PRESTO_DEV_FAILURE_DETECTOR_WARMUP:-1s}"
   local failure_decay="${PRESTO_DEV_FAILURE_DETECTOR_DECAY_SECONDS:-1}"
+  local failure_expiration_grace="${PRESTO_DEV_FAILURE_DETECTOR_EXPIRATION_GRACE:-3s}"
   local worker_announcement_ms="${PRESTO_DEV_ANNOUNCEMENT_MAX_FREQUENCY_MS:-1000}"
 
   set_properties_file_value "discovery.max-age" "$discovery_max_age" "$coordinator_config"
@@ -379,6 +380,7 @@ function apply_dev_discovery_tuning() {
   set_properties_file_value "failure-detector.heartbeat-interval" "$failure_heartbeat" "$coordinator_config"
   set_properties_file_value "failure-detector.warmup-interval" "$failure_warmup" "$coordinator_config"
   set_properties_file_value "failure-detector.exponential-decay-seconds" "$failure_decay" "$coordinator_config"
+  set_properties_file_value "failure-detector.expiration-grace-interval" "$failure_expiration_grace" "$coordinator_config"
 
   local worker_config
   for worker_config in "${config_dir}"/etc_worker*/config_native.properties; do
@@ -386,7 +388,7 @@ function apply_dev_discovery_tuning() {
     set_properties_file_value "announcement-max-frequency-ms" "$worker_announcement_ms" "$worker_config"
   done
 
-  echo "Dev discovery tuning: discovery.max-age=${discovery_max_age} discovery.store-cache-ttl=${discovery_store_cache_ttl} node-discovery-poll-ms=${node_discovery_poll_ms} worker-announcement-ms=${worker_announcement_ms}"
+  echo "Dev discovery tuning: discovery.max-age=${discovery_max_age} discovery.store-cache-ttl=${discovery_store_cache_ttl} node-discovery-poll-ms=${node_discovery_poll_ms} failure-expiration-grace=${failure_expiration_grace} worker-announcement-ms=${worker_announcement_ms}"
 }
 
 function apply_dev_node_addresses() {
@@ -809,16 +811,19 @@ missing = [
     for service, alternatives in expected
     if not any(url in node_text for url in alternatives)
 ]
+unexpected_count = isinstance(nodes, list) and len(nodes) != len(expected)
 unexpected = sorted(
     url for url in observed_urls
     if str(urlparse(url).port) in worker_ports and url not in valid_urls
 )
 
-if missing or unexpected:
+if missing or unexpected or unexpected_count:
     if quiet:
         sys.exit(1)
 
     print("ERROR: coordinator node view does not match the current worker containers.", file=sys.stderr)
+    if unexpected_count:
+        print(f"  expected exactly {len(expected)} worker nodes, but coordinator reports {len(nodes)}", file=sys.stderr)
     for service, alternatives in missing:
         print(f"  missing {service}: expected one of {', '.join(alternatives)}", file=sys.stderr)
     for url in unexpected:
