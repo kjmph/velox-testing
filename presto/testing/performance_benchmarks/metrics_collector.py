@@ -18,11 +18,17 @@ Standalone usage:
 import argparse
 import json
 import math
+import os
+import re
+import subprocess
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from .presto_api import fetch_json, fetch_text, get_nodes
+
+
+_WORKER_URI_RESOLVER = None
 
 
 def collect_metrics(query_id: str, query_name: str, hostname: str, port: int, output_dir: str) -> None:
@@ -87,13 +93,15 @@ def _collect_worker_data(query_info: dict) -> tuple[dict, dict]:
     all_worker_tasks = {}
     all_worker_metrics = {}
 
+    resolver = _worker_uri_resolver()
     for worker_uri, task_ids in tasks_by_worker.items():
         worker_id = _worker_id_from_uri(worker_uri)
+        fetch_worker_uri = resolver.resolve(worker_uri)
 
         # Collect detailed task info from worker
         worker_tasks = []
         for task_id in task_ids:
-            task_data = fetch_json(f"{worker_uri}/v1/task/{task_id}")
+            task_data = fetch_json(f"{fetch_worker_uri}/v1/task/{task_id}")
             if task_data:
                 worker_tasks.append(task_data)
 
@@ -101,11 +109,138 @@ def _collect_worker_data(query_info: dict) -> tuple[dict, dict]:
             all_worker_tasks[worker_id] = worker_tasks
 
         # Collect worker metrics
-        metrics = _fetch_worker_metrics(worker_uri)
+        metrics = _fetch_worker_metrics(fetch_worker_uri)
         if metrics:
             all_worker_metrics[worker_id] = metrics
 
     return all_worker_tasks, all_worker_metrics
+
+
+class WorkerUriResolver:
+    def __init__(self) -> None:
+        self._host_map = _load_worker_host_map()
+        self._docker_ip_cache: dict[str, str | None] = {}
+
+    def resolve(self, uri: str) -> str:
+        parsed = urlparse(uri)
+        host = parsed.hostname
+        if not host:
+            return uri
+
+        replacement_host = self._host_map.get(host)
+        if replacement_host is None and _looks_like_presto_worker(host):
+            replacement_host = self._docker_container_ip(host)
+
+        if replacement_host is None:
+            return uri
+
+        netloc = replacement_host
+        if parsed.port is not None:
+            netloc = f"{replacement_host}:{parsed.port}"
+        return urlunparse(
+            (
+                parsed.scheme,
+                netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+
+    def _docker_container_ip(self, container_name: str) -> str | None:
+        if container_name not in self._docker_ip_cache:
+            self._docker_ip_cache[container_name] = _docker_container_ip(container_name)
+        return self._docker_ip_cache[container_name]
+
+
+def _worker_uri_resolver() -> WorkerUriResolver:
+    global _WORKER_URI_RESOLVER
+    if _WORKER_URI_RESOLVER is None:
+        _WORKER_URI_RESOLVER = WorkerUriResolver()
+    return _WORKER_URI_RESOLVER
+
+
+def _load_worker_host_map() -> dict[str, str]:
+    """Return host rewrites for worker URIs reported by the coordinator.
+
+    Local Docker runs report task URLs using container DNS names such as
+    presto-native-worker-gpu-2. Those names resolve inside the Docker network
+    but not from the host process running pytest. Prefer the generated network
+    compose override, because GPU ids can be sparse while IPs are assigned by
+    service order.
+    """
+    host_map: dict[str, str] = {}
+
+    env_map = os.environ.get("PRESTO_BENCHMARK_WORKER_HOST_MAP", "")
+    for entry in env_map.split(","):
+        if not entry.strip():
+            continue
+        if "=" not in entry:
+            continue
+        host, replacement = entry.split("=", 1)
+        host = host.strip()
+        replacement = replacement.strip()
+        if host and replacement:
+            host_map[host] = replacement
+
+    presto_root = Path(__file__).resolve().parents[2]
+    generated_dir = presto_root / "docker" / "docker-compose" / "generated"
+    for path in (
+        generated_dir / "docker-compose.gpu-dev-network.yml",
+        generated_dir / "docker-compose.cpu-dev-network.yml",
+    ):
+        host_map.update(_load_worker_host_map_from_compose(path))
+
+    return host_map
+
+
+def _load_worker_host_map_from_compose(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    result: dict[str, str] = {}
+    service = None
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.rstrip()
+        service_match = re.match(r"^  ([A-Za-z0-9_.-]+):\s*$", line)
+        if service_match:
+            service = service_match.group(1)
+            continue
+
+        if service and _looks_like_presto_worker(service):
+            ip_match = re.match(r"^\s+ipv4_address:\s*([0-9.]+)\s*$", line)
+            if ip_match:
+                result[service] = ip_match.group(1)
+                service = None
+
+    return result
+
+
+def _looks_like_presto_worker(host: str) -> bool:
+    return host.startswith("presto-native-worker-")
+
+
+def _docker_container_ip(container_name: str) -> str | None:
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                container_name,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    match = re.search(r"\d+\.\d+\.\d+\.\d+", result.stdout)
+    return match.group(0) if match else None
 
 
 def _extract_embedded_tasks(query_info: dict) -> dict:

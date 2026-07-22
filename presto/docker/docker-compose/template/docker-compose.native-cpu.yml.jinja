@@ -80,7 +80,7 @@ services:
       # convention.
       VELOX_UCX_CPU_PORT: "{{ 10000 + 10 * worker.id + 3 }}"
       VELOX_UCX_LOG_LEVEL: "${VELOX_UCX_LOG_LEVEL:-0}"
-      VELOX_UCX_NUM_PROGRESS_THREADS: "${VELOX_UCX_NUM_PROGRESS_THREADS:-4}"
+      VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN: "${VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN:-256}"
       # Optional override for the same-host transport fingerprint. If unset,
       # the worker hashes /proc/sys/kernel/random/boot_id plus IPC/PID
       # namespace identities.
@@ -89,7 +89,6 @@ services:
       # endpoints. Same-host CPU worker-address endpoints disable it
       # automatically so UCX can select posix/sysv/cma.
       VELOX_UCX_CPU_ERROR_HANDLING: "${VELOX_UCX_CPU_ERROR_HANDLING:-1}"
-      VELOX_UCX_CPU_PIPELINE_DEPTH: "${VELOX_UCX_CPU_PIPELINE_DEPTH:-1}"
       VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER:-256}"
       VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER:-128}"
       VELOX_UCX_CPU_MAX_PAGE_BYTES: "${VELOX_UCX_CPU_MAX_PAGE_BYTES:-33554432}"
@@ -135,7 +134,7 @@ services:
       # so UCX port = 10000 + 3.
       VELOX_UCX_CPU_PORT: "10003"
       VELOX_UCX_LOG_LEVEL: "${VELOX_UCX_LOG_LEVEL:-0}"
-      VELOX_UCX_NUM_PROGRESS_THREADS: "${VELOX_UCX_NUM_PROGRESS_THREADS:-4}"
+      VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN: "${VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN:-256}"
       # Optional override for the same-host transport fingerprint. If unset,
       # the worker hashes /proc/sys/kernel/random/boot_id plus IPC/PID
       # namespace identities.
@@ -144,7 +143,6 @@ services:
       # endpoints. Same-host CPU worker-address endpoints disable it
       # automatically so UCX can select posix/sysv/cma.
       VELOX_UCX_CPU_ERROR_HANDLING: "${VELOX_UCX_CPU_ERROR_HANDLING:-1}"
-      VELOX_UCX_CPU_PIPELINE_DEPTH: "${VELOX_UCX_CPU_PIPELINE_DEPTH:-1}"
       VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_HIGH_WATER:-256}"
       VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER: "${VELOX_UCX_CPU_RECV_QUEUE_LOW_WATER:-128}"
       VELOX_UCX_CPU_MAX_PAGE_BYTES: "${VELOX_UCX_CPU_MAX_PAGE_BYTES:-33554432}"

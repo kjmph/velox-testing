@@ -13,6 +13,8 @@ DEV_CLEAN_FIRST=false
 DEV_SKIP_UI="${PRESTO_DEV_SKIP_UI:-false}"
 DEV_JAVA_CLEAN="${PRESTO_DEV_JAVA_CLEAN:-false}"
 DEV_PRESTO_DEPENDENCIES="${PRESTO_DEV_PRESTO_DEPENDENCIES:-false}"
+DEV_UCX_SOURCE="${PRESTO_DEV_UCX_SOURCE:-}"
+DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 DEV_ARGS=()
 
 print_dev_help() {
@@ -46,6 +48,13 @@ DEV_OPTIONS:
         dev coordinator image and their Maven dependencies. This is the fast
         coordinator iteration path and avoids unrelated tools like
         presto-verifier.
+    --ucx-source PATH
+        Rebuild the local Presto dependency image from this UCX source tree
+        before building GPU workers. Can also be set with PRESTO_DEV_UCX_SOURCE.
+    --velox-source PATH
+        Build native GPU workers from this Velox source tree instead of the
+        default ../velox sibling. The path must be inside the Docker build
+        context root. Can also be set with PRESTO_DEV_VELOX_SOURCE.
 
 START_OPTIONS:
     Accepts the same GPU options as start_native_gpu_presto.sh, including:
@@ -70,12 +79,27 @@ DEV NETWORK:
     PRESTO_DEV_NETWORK_SUBNET, PRESTO_DEV_NETWORK_GATEWAY,
     PRESTO_DEV_COORDINATOR_IP, and PRESTO_DEV_WORKER_<N>_IP.
 
+CUDF DEV TUNING:
+    Override generated GPU worker cuDF settings with:
+    PRESTO_CUDF_DISTINCT_HASH_JOIN_ENABLED=true|false
+    PRESTO_CUDF_PROBE_UNIQUE_INNER_JOIN_ENABLED=true|false
+    PRESTO_CUDF_AST_EXPRESSION_ENABLED=true|false
+    PRESTO_CUDF_AST_EXPRESSION_PRIORITY=<integer>
+    PRESTO_CUDF_JIT_EXPRESSION_ENABLED=true|false
+    PRESTO_CUDF_MEMORY_RESOURCE=cuda|pool|async|arena|managed|managed_pool|managed_async|prefetch_managed|prefetch_managed_pool|prefetch_managed_async
+    PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default 50000000)
+    PRESTO_CUDF_BATCH_SIZE_MAX_THRESHOLD=<positive integer rows> (default unset)
+    PRESTO_CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default 150000000)
+    VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN=1
+
 Examples:
     $0 -w 2 --wait -b worker --restart-target worker
     $0 -w 2 -g 2,3 --wait -b worker --restart-target worker
     $0 -w 2 --wait -b all --restart-target all
     $0 -w 2 --wait -b coordinator --restart-target coordinator --skip-ui
     $0 -w 2 --wait -b coordinator --restart-target coordinator --skip-ui --dev-presto-dependencies
+    $0 -w 2 --wait -b worker --restart-target worker --ucx-source ../../ucx
+    $0 -w 2 --wait -b worker --restart-target worker --velox-source ../../velox-gpu-ucx-original
     $0 -w 2 --wait --restart-target none
 
 EOF
@@ -129,6 +153,14 @@ while [[ $# -gt 0 ]]; do
       DEV_PRESTO_DEPENDENCIES=true
       shift
       ;;
+    --ucx-source)
+      DEV_UCX_SOURCE=${2:?Error: --ucx-source requires a value}
+      shift 2
+      ;;
+    --velox-source)
+      DEV_VELOX_SOURCE=${2:?Error: --velox-source requires a value}
+      shift 2
+      ;;
     *)
       DEV_ARGS+=("$1")
       shift
@@ -151,6 +183,22 @@ if [[ ! ${DEV_RESTART_TARGET} =~ ^(all|coordinator|worker|none)$ ]]; then
   exit 1
 fi
 
+if [[ -n "$DEV_UCX_SOURCE" ]]; then
+  DEV_UCX_SOURCE="$(cd "$DEV_UCX_SOURCE" && pwd)"
+  if [[ ! -f "${DEV_UCX_SOURCE}/autogen.sh" ]]; then
+    echo "ERROR: --ucx-source must point to a UCX source tree with autogen.sh." >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "$DEV_VELOX_SOURCE" ]]; then
+  DEV_VELOX_SOURCE="$(cd "$DEV_VELOX_SOURCE" && pwd)"
+  if [[ ! -f "${DEV_VELOX_SOURCE}/CMakeLists.txt" || ! -d "${DEV_VELOX_SOURCE}/velox" ]]; then
+    echo "ERROR: --velox-source must point to a Velox source tree." >&2
+    exit 1
+  fi
+fi
+
 if [[ "$DEV_CLEAN_FIRST" == "true" && "$DEV_RESTART_TARGET" =~ ^(worker|none)$ ]]; then
   echo "ERROR: --clean-first removes the coordinator, so --restart-target ${DEV_RESTART_TARGET} cannot produce a usable cluster." >&2
   echo "Use --restart-target all with --clean-first, or omit --clean-first for the fast path." >&2
@@ -165,8 +213,16 @@ set +u
 source "${SCRIPT_DIR}/start_presto_helper_parse_args.sh"
 set -u
 
+function effective_velox_source() {
+  if [[ -n "$DEV_VELOX_SOURCE" ]]; then
+    echo "$DEV_VELOX_SOURCE"
+  else
+    echo "${REPO_ROOT}/../velox"
+  fi
+}
+
 function validate_sibling_repos() {
-  "${REPO_ROOT}/scripts/validate_directories_exist.sh" "${REPO_ROOT}/../presto" "${REPO_ROOT}/../velox"
+  "${REPO_ROOT}/scripts/validate_directories_exist.sh" "${REPO_ROOT}/../presto" "$(effective_velox_source)"
 }
 
 function validate_sccache_auth() {
@@ -194,13 +250,31 @@ COORDINATOR_SERVICE="presto-coordinator"
 COORDINATOR_IMAGE="${COORDINATOR_SERVICE}:${PRESTO_IMAGE_TAG}"
 GPU_WORKER_SERVICE="presto-native-worker-gpu"
 GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}"
-DEPS_IMAGE="presto/prestissimo-dependency:centos9-${USER:-latest}"
+DEPS_IMAGE="${DEPS_IMAGE:-presto/prestissimo-dependency:centos9-${USER:-latest}}"
+GENERIC_DEPS_IMAGE="${GENERIC_DEPS_IMAGE:-presto/prestissimo-dependency:centos9}"
 export DEPS_IMAGE
 
 BUILD_TARGET_ARG=()
 
 function is_image_missing() {
   [[ -z "$(docker images -q "$1")" ]]
+}
+
+function ensure_deps_image_available() {
+  if ! is_image_missing "${DEPS_IMAGE}"; then
+    return 0
+  fi
+
+  if ! is_image_missing "${GENERIC_DEPS_IMAGE}"; then
+    echo "Retagging ${GENERIC_DEPS_IMAGE} as missing user deps image ${DEPS_IMAGE}"
+    docker tag "${GENERIC_DEPS_IMAGE}" "${DEPS_IMAGE}"
+    return 0
+  fi
+
+  echo "ERROR: Presto dependencies/run-time image '${DEPS_IMAGE}' not found!" >&2
+  echo "Also checked fallback image '${GENERIC_DEPS_IMAGE}', but it was not found." >&2
+  echo "Build it with presto/scripts/build_centos_deps_image.sh, pass --ucx-source to this script, or fetch it first." >&2
+  return 1
 }
 
 function conditionally_add_build_target() {
@@ -242,12 +316,15 @@ function emit_git_hash_input() {
 function compute_source_hash() {
   {
     emit_git_hash_input "${REPO_ROOT}/../presto" "presto"
-    emit_git_hash_input "${REPO_ROOT}/../velox" "velox"
+    emit_git_hash_input "$(effective_velox_source)" "velox"
   } | sha256sum | awk '{print $1}'
 }
 
 function compute_native_build_cache_scope() {
-  realpath "${REPO_ROOT}" | sha256sum | awk '{print substr($1, 1, 16)}'
+  {
+    realpath "${REPO_ROOT}"
+    realpath "$(effective_velox_source)"
+  } | sha256sum | awk '{print substr($1, 1, 16)}'
 }
 
 function compute_presto_package_hash() {
@@ -359,6 +436,14 @@ function set_properties_file_value() {
   fi
 }
 
+function remove_properties_file_key() {
+  local key=$1
+  local file=$2
+  local key_regex="${key//./\\.}"
+
+  sed -i "/^${key_regex}=/d" "$file"
+}
+
 function gpu_worker_ids() {
   if [[ -n "${GPU_IDS:-}" ]]; then
     local id
@@ -457,12 +542,13 @@ function apply_dev_discovery_tuning() {
 
   [[ -f "$coordinator_config" ]] || return
 
-  local discovery_max_age="${PRESTO_DEV_DISCOVERY_MAX_AGE:-3s}"
+  local discovery_max_age="${PRESTO_DEV_DISCOVERY_MAX_AGE:-30s}"
   local discovery_store_cache_ttl="${PRESTO_DEV_DISCOVERY_STORE_CACHE_TTL:-250ms}"
   local node_discovery_poll_ms="${PRESTO_DEV_NODE_DISCOVERY_POLL_MS:-500}"
   local failure_heartbeat="${PRESTO_DEV_FAILURE_DETECTOR_HEARTBEAT:-250ms}"
   local failure_warmup="${PRESTO_DEV_FAILURE_DETECTOR_WARMUP:-1s}"
   local failure_decay="${PRESTO_DEV_FAILURE_DETECTOR_DECAY_SECONDS:-1}"
+  local failure_expiration_grace="${PRESTO_DEV_FAILURE_DETECTOR_EXPIRATION_GRACE:-30s}"
   local worker_announcement_ms="${PRESTO_DEV_ANNOUNCEMENT_MAX_FREQUENCY_MS:-1000}"
 
   set_properties_file_value "discovery.max-age" "$discovery_max_age" "$coordinator_config"
@@ -471,6 +557,7 @@ function apply_dev_discovery_tuning() {
   set_properties_file_value "failure-detector.heartbeat-interval" "$failure_heartbeat" "$coordinator_config"
   set_properties_file_value "failure-detector.warmup-interval" "$failure_warmup" "$coordinator_config"
   set_properties_file_value "failure-detector.exponential-decay-seconds" "$failure_decay" "$coordinator_config"
+  set_properties_file_value "failure-detector.expiration-grace-interval" "$failure_expiration_grace" "$coordinator_config"
 
   local worker_config
   for worker_config in "${config_dir}"/etc_worker*/config_native.properties; do
@@ -478,7 +565,146 @@ function apply_dev_discovery_tuning() {
     set_properties_file_value "announcement-max-frequency-ms" "$worker_announcement_ms" "$worker_config"
   done
 
-  echo "Dev discovery tuning: discovery.max-age=${discovery_max_age} discovery.store-cache-ttl=${discovery_store_cache_ttl} node-discovery-poll-ms=${node_discovery_poll_ms} worker-announcement-ms=${worker_announcement_ms}"
+  echo "Dev discovery tuning: discovery.max-age=${discovery_max_age} discovery.store-cache-ttl=${discovery_store_cache_ttl} node-discovery-poll-ms=${node_discovery_poll_ms} failure-expiration-grace=${failure_expiration_grace} worker-announcement-ms=${worker_announcement_ms}"
+}
+
+function apply_dev_cudf_tuning() {
+  local config_dir="${SCRIPT_DIR}/../docker/config/generated/gpu"
+  local distinct_hash_join_enabled="${PRESTO_CUDF_DISTINCT_HASH_JOIN_ENABLED:-${CUDF_DISTINCT_HASH_JOIN_ENABLED:-}}"
+  local probe_unique_inner_join_enabled="${PRESTO_CUDF_PROBE_UNIQUE_INNER_JOIN_ENABLED:-${CUDF_PROBE_UNIQUE_INNER_JOIN_ENABLED:-}}"
+  local ast_expression_enabled="${PRESTO_CUDF_AST_EXPRESSION_ENABLED:-${CUDF_AST_EXPRESSION_ENABLED:-}}"
+  local ast_expression_priority="${PRESTO_CUDF_AST_EXPRESSION_PRIORITY:-${CUDF_AST_EXPRESSION_PRIORITY:-}}"
+  local jit_expression_enabled="${PRESTO_CUDF_JIT_EXPRESSION_ENABLED:-${CUDF_JIT_EXPRESSION_ENABLED:-}}"
+  local memory_resource="${PRESTO_CUDF_MEMORY_RESOURCE:-${CUDF_MEMORY_RESOURCE:-async}}"
+  local batch_size_min_threshold="${PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD:-${CUDF_BATCH_SIZE_MIN_THRESHOLD:-100000000}}"
+  local batch_size_max_threshold="${PRESTO_CUDF_BATCH_SIZE_MAX_THRESHOLD:-${CUDF_BATCH_SIZE_MAX_THRESHOLD:-}}"
+  local final_agg_batch_size_min_threshold="${PRESTO_CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD:-${CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD:-}}"
+  local output_mr="${PRESTO_CUDF_OUTPUT_MR:-${CUDF_OUTPUT_MR:-}}"
+
+  if [[ -n "$distinct_hash_join_enabled" ]]; then
+    if ! distinct_hash_join_enabled="$(normalize_dev_bool "$distinct_hash_join_enabled" "PRESTO_CUDF_DISTINCT_HASH_JOIN_ENABLED")"; then
+      exit 1
+    fi
+  fi
+  if [[ -n "$probe_unique_inner_join_enabled" ]]; then
+    if ! probe_unique_inner_join_enabled="$(normalize_dev_bool "$probe_unique_inner_join_enabled" "PRESTO_CUDF_PROBE_UNIQUE_INNER_JOIN_ENABLED")"; then
+      exit 1
+    fi
+  fi
+  if [[ -n "$ast_expression_enabled" ]]; then
+    if ! ast_expression_enabled="$(normalize_dev_bool "$ast_expression_enabled" "PRESTO_CUDF_AST_EXPRESSION_ENABLED")"; then
+      exit 1
+    fi
+  fi
+  if [[ -n "$jit_expression_enabled" ]]; then
+    if ! jit_expression_enabled="$(normalize_dev_bool "$jit_expression_enabled" "PRESTO_CUDF_JIT_EXPRESSION_ENABLED")"; then
+      exit 1
+    fi
+  fi
+  if [[ -n "$ast_expression_priority" && ! "$ast_expression_priority" =~ ^-?[0-9]+$ ]]; then
+    echo "ERROR: PRESTO_CUDF_AST_EXPRESSION_PRIORITY must be an integer." >&2
+    exit 1
+  fi
+
+  if [[ ! "$batch_size_min_threshold" =~ ^[0-9]+$ || "$batch_size_min_threshold" -le 0 ]]; then
+    echo "ERROR: PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD must be a positive integer row count." >&2
+    exit 1
+  fi
+  if [[ -n "$batch_size_max_threshold" &&
+        ( ! "$batch_size_max_threshold" =~ ^[0-9]+$ || "$batch_size_max_threshold" -le 0 ) ]]; then
+    echo "ERROR: PRESTO_CUDF_BATCH_SIZE_MAX_THRESHOLD must be a positive integer row count." >&2
+    exit 1
+  fi
+  if [[ -n "$final_agg_batch_size_min_threshold" &&
+        ( ! "$final_agg_batch_size_min_threshold" =~ ^[0-9]+$ || "$final_agg_batch_size_min_threshold" -le 0 ) ]]; then
+    echo "ERROR: PRESTO_CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD must be a positive integer row count." >&2
+    exit 1
+  fi
+  if [[ -n "$output_mr" ]]; then
+    case "$output_mr" in
+      cuda|pool|async|arena|managed|managed_pool|managed_async|prefetch_managed|prefetch_managed_pool|prefetch_managed_async)
+        ;;
+      *)
+        echo "ERROR: PRESTO_CUDF_OUTPUT_MR must be one of: cuda, pool, async, arena, managed, managed_pool, managed_async, prefetch_managed, prefetch_managed_pool, prefetch_managed_async." >&2
+        exit 1
+        ;;
+    esac
+  fi
+  case "$memory_resource" in
+    cuda|pool|async|arena|managed|managed_pool|managed_async|prefetch_managed|prefetch_managed_pool|prefetch_managed_async)
+      ;;
+    *)
+      echo "ERROR: PRESTO_CUDF_MEMORY_RESOURCE must be one of: cuda, pool, async, arena, managed, managed_pool, managed_async, prefetch_managed, prefetch_managed_pool, prefetch_managed_async." >&2
+      exit 1
+      ;;
+  esac
+  local worker_config
+  for worker_config in "${config_dir}"/etc_worker*/config_native.properties; do
+    [[ -f "$worker_config" ]] || continue
+    if [[ -n "$distinct_hash_join_enabled" ]]; then
+      set_properties_file_value "cudf.distinct_hash_join_enabled" "$distinct_hash_join_enabled" "$worker_config"
+    else
+      remove_properties_file_key "cudf.distinct_hash_join_enabled" "$worker_config"
+    fi
+    if [[ -n "$probe_unique_inner_join_enabled" ]]; then
+      set_properties_file_value "cudf.probe_unique_inner_join_enabled" "$probe_unique_inner_join_enabled" "$worker_config"
+    else
+      remove_properties_file_key "cudf.probe_unique_inner_join_enabled" "$worker_config"
+    fi
+    remove_properties_file_key "cudf.dynamic_filter_enabled" "$worker_config"
+    if [[ -n "$ast_expression_enabled" ]]; then
+      set_properties_file_value "cudf.ast_expression_enabled" "$ast_expression_enabled" "$worker_config"
+    fi
+    if [[ -n "$ast_expression_priority" ]]; then
+      set_properties_file_value "cudf.ast_expression_priority" "$ast_expression_priority" "$worker_config"
+    fi
+    if [[ -n "$jit_expression_enabled" ]]; then
+      set_properties_file_value "cudf.jit_expression_enabled" "$jit_expression_enabled" "$worker_config"
+    fi
+    set_properties_file_value "cudf.memory_resource" "$memory_resource" "$worker_config"
+    set_properties_file_value "cudf.batch_size_min_threshold" "$batch_size_min_threshold" "$worker_config"
+    if [[ -n "$batch_size_max_threshold" ]]; then
+      set_properties_file_value "cudf.batch_size_max_threshold" "$batch_size_max_threshold" "$worker_config"
+    else
+      remove_properties_file_key "cudf.batch_size_max_threshold" "$worker_config"
+    fi
+    if [[ -n "$final_agg_batch_size_min_threshold" ]]; then
+      set_properties_file_value "cudf.final_aggregation_batch_size_min_threshold" "$final_agg_batch_size_min_threshold" "$worker_config"
+    else
+      remove_properties_file_key "cudf.final_aggregation_batch_size_min_threshold" "$worker_config"
+    fi
+    if [[ -n "$output_mr" ]]; then
+      set_properties_file_value "cudf.output_mr" "$output_mr" "$worker_config"
+    else
+      remove_properties_file_key "cudf.output_mr" "$worker_config"
+    fi
+    remove_properties_file_key "cudf.transport_safe_mr" "$worker_config"
+    remove_properties_file_key "cudf.ucx_mr" "$worker_config"
+  done
+
+  local message="Dev cuDF tuning: cudf.distinct_hash_join_enabled=${distinct_hash_join_enabled:-<default>}"
+  message="${message} cudf.probe_unique_inner_join_enabled=${probe_unique_inner_join_enabled:-<default>}"
+  message="${message} cudf.ast_expression_enabled=${ast_expression_enabled:-<default>}"
+  message="${message} cudf.ast_expression_priority=${ast_expression_priority:-<default>}"
+  message="${message} cudf.jit_expression_enabled=${jit_expression_enabled:-<default>}"
+  message="${message} cudf.memory_resource=${memory_resource}"
+  message="${message} cudf.batch_size_min_threshold=${batch_size_min_threshold}"
+  if [[ -n "$batch_size_max_threshold" ]]; then
+    message="${message} cudf.batch_size_max_threshold=${batch_size_max_threshold}"
+  else
+    message="${message} cudf.batch_size_max_threshold=<unset>"
+  fi
+  if [[ -n "$final_agg_batch_size_min_threshold" ]]; then
+    message="${message} cudf.final_aggregation_batch_size_min_threshold=${final_agg_batch_size_min_threshold}"
+  else
+    message="${message} cudf.final_aggregation_batch_size_min_threshold=<unset>"
+  fi
+  if [[ -n "$output_mr" ]]; then
+    message="${message} cudf.output_mr=${output_mr}"
+  else
+    message="${message} cudf.output_mr=<main>"
+  fi
+  echo "$message"
 }
 
 function apply_dev_node_addresses() {
@@ -581,6 +807,72 @@ function render_dev_coordinator_override() {
   echo "$override_path"
 }
 
+function render_dev_velox_source_dockerfile() {
+  local rendered_dir=$1
+  local velox_source=$2
+  local dockerfile_path="${rendered_dir}/native_build.velox_source.dockerfile"
+  local source_dockerfile="${SCRIPT_DIR}/../docker/native_build.dockerfile"
+  local tmp_dockerfile="${dockerfile_path}.tmp"
+  local context_root
+  local relative_velox_source
+
+  if [[ ! -f "$source_dockerfile" ]]; then
+    echo "ERROR: native build Dockerfile not found: ${source_dockerfile}" >&2
+    exit 1
+  fi
+  if ! grep -Fq "source=velox,target=/presto_native_staging/presto/velox" "$source_dockerfile"; then
+    echo "ERROR: native build Dockerfile no longer has the expected Velox bind mount: ${source_dockerfile}" >&2
+    exit 1
+  fi
+
+  context_root="$(cd "${REPO_ROOT}/.." && pwd)"
+  relative_velox_source="$(realpath --relative-to="$context_root" "$velox_source")"
+  if [[ "$relative_velox_source" == ".." || "$relative_velox_source" == ../* || "$relative_velox_source" == /* ]]; then
+    echo "ERROR: --velox-source must be inside the Docker build context root: ${context_root}" >&2
+    exit 1
+  fi
+  if [[ "$relative_velox_source" =~ [[:space:]] ]]; then
+    echo "ERROR: --velox-source path cannot contain whitespace: ${velox_source}" >&2
+    exit 1
+  fi
+
+  sed \
+    -e "s+source=velox,target=/presto_native_staging/presto/velox+source=${relative_velox_source},target=/presto_native_staging/presto/velox+" \
+    "$source_dockerfile" > "$tmp_dockerfile"
+  if [[ ! -s "$tmp_dockerfile" ]]; then
+    echo "ERROR: generated alternate Velox native build Dockerfile is empty." >&2
+    rm -f "$tmp_dockerfile"
+    exit 1
+  fi
+  mv "$tmp_dockerfile" "$dockerfile_path"
+  echo "$dockerfile_path"
+}
+
+function render_dev_velox_source_override() {
+  local rendered_dir=$1
+  local override_path="${rendered_dir}/docker-compose.gpu-dev-velox-source.yml"
+  local dockerfile_path
+  local dockerfile_in_context
+  local worker_services=()
+  local service
+
+  mkdir -p "$rendered_dir"
+  dockerfile_path="$(render_dev_velox_source_dockerfile "$rendered_dir" "$DEV_VELOX_SOURCE")"
+  dockerfile_in_context="velox-testing/presto/docker/docker-compose/generated/$(basename "$dockerfile_path")"
+  mapfile -t worker_services < <(gpu_worker_services)
+
+  {
+    printf "services:\n"
+    for service in "${worker_services[@]}"; do
+      printf "  %s:\n" "$service"
+      printf "    build:\n"
+      printf "      dockerfile: %s\n" "$dockerfile_in_context"
+    done
+  } > "$override_path"
+
+  echo "$override_path"
+}
+
 function build_targets_include() {
   local service=$1
   local target
@@ -651,6 +943,7 @@ if [[ "${SKIP_GENERATE_CONFIG:-false}" != "true" ]]; then
   VARIANT_TYPE=gpu "${SCRIPT_DIR}/generate_presto_config.sh"
 fi
 apply_dev_node_addresses
+apply_dev_cudf_tuning
 apply_dev_discovery_tuning
 
 RENDERED_DIR="${SCRIPT_DIR}/../docker/docker-compose/generated"
@@ -684,6 +977,11 @@ if build_targets_include "$COORDINATOR_SERVICE"; then
   COORDINATOR_DEV_OVERRIDE_PATH="$(render_dev_coordinator_override "$RENDERED_DIR")"
   COMPOSE_FILE_ARGS+=(-f "$COORDINATOR_DEV_OVERRIDE_PATH")
 fi
+if build_targets_include_gpu_worker && [[ -n "$DEV_VELOX_SOURCE" ]]; then
+  VELOX_SOURCE_OVERRIDE_PATH="$(render_dev_velox_source_override "$RENDERED_DIR")"
+  COMPOSE_FILE_ARGS+=(-f "$VELOX_SOURCE_OVERRIDE_PATH")
+  echo "Using alternate Velox source for native worker build: ${DEV_VELOX_SOURCE}"
+fi
 if [[ "$DEV_RESTART_TARGET" != "none" || "$WAIT_FOR_WORKERS" == "true" ]]; then
   DEV_NETWORK_OVERRIDE_PATH="$(render_dev_network_override "$RENDERED_DIR")"
   COMPOSE_FILE_ARGS+=(-f "$DEV_NETWORK_OVERRIDE_PATH")
@@ -708,10 +1006,14 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
   fi
   NATIVE_BUILD_CACHE_SCOPE="${NATIVE_BUILD_CACHE_SCOPE:-default}"
 
-  if build_targets_include_gpu_worker && is_image_missing "${DEPS_IMAGE}"; then
-    echo "ERROR: Presto dependencies/run-time image '${DEPS_IMAGE}' not found!" >&2
-    echo "Build it with presto/scripts/build_centos_deps_image.sh or fetch it first." >&2
-    exit 1
+  if build_targets_include_gpu_worker && [[ -n "$DEV_UCX_SOURCE" ]]; then
+    DEPS_BUILD_ARGS=(--image-name "$DEPS_IMAGE" --ucx-source "$DEV_UCX_SOURCE")
+    [[ -n "${SKIP_CACHE_ARG:-}" ]] && DEPS_BUILD_ARGS+=(--no-cache)
+    "${SCRIPT_DIR}/build_centos_deps_image.sh" "${DEPS_BUILD_ARGS[@]}"
+  fi
+
+  if build_targets_include_gpu_worker; then
+    ensure_deps_image_available || exit 1
   fi
 
   PRESTO_VERSION=testing
@@ -749,6 +1051,7 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
   echo "Building services: ${BUILD_TARGET_ARG[*]}"
   docker_compose --progress=plain "${COMPOSE_FILE_ARGS[@]}" build \
     ${SKIP_CACHE_ARG:-} \
+    --build-arg "BASE_IMAGE=${DEPS_IMAGE}" \
     --build-arg "VELOX_TESTING_SOURCE_HASH=${SOURCE_HASH}" \
     --build-arg "NATIVE_BUILD_CACHE_SCOPE=${NATIVE_BUILD_CACHE_SCOPE}" \
     --build-arg "PRESTO_DEV_PACKAGE_HASH=${PRESTO_DEV_PACKAGE_HASH}" \
@@ -764,6 +1067,42 @@ function container_ip_on_dev_network() {
   local container=$1
   local network="$PRESTO_DEV_NETWORK_NAME"
   docker inspect -f "{{with index .NetworkSettings.Networks \"${network}\"}}{{.IPAddress}}{{end}}" "$container" 2>/dev/null || true
+}
+
+function fail_if_gpu_workers_exited() {
+  local worker_services=()
+  local service
+  local state
+  local exit_code
+  local failed=()
+
+  mapfile -t worker_services < <(gpu_worker_services)
+  for service in "${worker_services[@]}"; do
+    state="$(docker inspect -f '{{.State.Status}}' "$service" 2>/dev/null || true)"
+    case "$state" in
+      ""|running)
+        continue
+        ;;
+      exited|dead)
+        exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$service" 2>/dev/null || true)"
+        failed+=("${service} (${state}, exit ${exit_code:-unknown})")
+        ;;
+    esac
+  done
+
+  if [[ "${#failed[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "ERROR: expected GPU worker container(s) exited before registering:" >&2
+  printf '  %s\n' "${failed[@]}" >&2
+  echo "Recent worker logs:" >&2
+  for service in "${failed[@]}"; do
+    service="${service%% *}"
+    echo "--- ${service} ---" >&2
+    docker logs "$service" --tail 40 >&2 || true
+  done
+  exit 1
 }
 
 function verify_gpu_worker_endpoints() {
@@ -828,16 +1167,19 @@ missing = [
     for worker_id, service, alternatives in expected
     if not any(url in node_text for url in alternatives)
 ]
+unexpected_count = isinstance(nodes, list) and len(nodes) != len(expected)
 unexpected = sorted(
     url for url in observed_urls
     if str(urlparse(url).port) in worker_ports and url not in valid_urls
 )
 
-if missing or unexpected:
+if missing or unexpected or unexpected_count:
     if quiet:
         sys.exit(1)
 
     print("ERROR: coordinator node view does not match the current GPU worker containers.", file=sys.stderr)
+    if unexpected_count:
+        print(f"  expected exactly {len(expected)} GPU worker nodes, but coordinator reports {len(nodes)}", file=sys.stderr)
     for worker_id, service, alternatives in missing:
         print(f"  missing GPU worker {worker_id} ({service}): expected one of {', '.join(alternatives)}", file=sys.stderr)
     for url in unexpected:
@@ -886,6 +1228,7 @@ if [[ "$WAIT_FOR_WORKERS" == "true" ]]; then
   workers=0
   endpoints_ready=false
   while [[ $(date +%s) -lt $deadline ]]; do
+    fail_if_gpu_workers_exited
     workers=$(python3 - <<'PY'
 import json
 import urllib.request

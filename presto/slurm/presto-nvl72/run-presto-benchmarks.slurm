@@ -61,11 +61,23 @@ export PORT=9200
 export CUDF_LIB=/usr/lib64/presto-native-libs
 
 # UCX Configuration
-export UCX_TLS=^ib,ud:aux,sm
-export UCX_MAX_RNDV_RAILS=1
-export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
-export UCX_TCP_KEEPINTVL=1ms
-export UCX_KEEPALIVE_INTERVAL=1ms
+# Preserve launcher-supplied UCX settings for experiments. The default keeps
+# the legacy TCP/shared-memory behavior, but an explicit mlx5 rail must not be
+# paired with a transport list that excludes IB/RDMA.
+export UCX_TLS="${UCX_TLS:-^ib,ud:aux,sm}"
+export UCX_MAX_RNDV_RAILS="${UCX_MAX_RNDV_RAILS:-1}"
+if [[ -n "${UCX_NET_DEVICES:-}" ]]; then
+    export UCX_NET_DEVICES
+fi
+if [[ "${UCX_NET_DEVICES:-}" == *mlx5_* && "${UCX_TLS}" == *^ib* ]]; then
+    echo "Error: UCX_NET_DEVICES=${UCX_NET_DEVICES} selects an mlx5 RDMA device, but UCX_TLS=${UCX_TLS} excludes IB/RDMA." >&2
+    echo "Set UCX_TLS explicitly, e.g. UCX_TLS=rc,cuda,self, or use a TCP netdev such as bond0." >&2
+    exit 1
+fi
+export UCX_RNDV_PIPELINE_ERROR_HANDLING="${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
+export UCX_TCP_KEEPINTVL="${UCX_TCP_KEEPINTVL:-1ms}"
+export UCX_KEEPALIVE_INTERVAL="${UCX_KEEPALIVE_INTERVAL:-1ms}"
+export UCX_MODULE_DIR="${UCX_MODULE_DIR:-/usr/local/lib/ucx}"
 
 # ==============================================================================
 # Computed Values

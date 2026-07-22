@@ -13,6 +13,7 @@ DEV_CLEAN_FIRST=false
 DEV_SKIP_UI="${PRESTO_DEV_SKIP_UI:-false}"
 DEV_JAVA_CLEAN="${PRESTO_DEV_JAVA_CLEAN:-false}"
 DEV_PRESTO_DEPENDENCIES="${PRESTO_DEV_PRESTO_DEPENDENCIES:-false}"
+DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 DEV_ARGS=()
 
 print_dev_help() {
@@ -46,6 +47,10 @@ DEV_OPTIONS:
         dev coordinator image and their Maven dependencies. This is the fast
         coordinator iteration path and avoids unrelated tools like
         presto-verifier.
+    --velox-source PATH
+        Build native CPU workers from this Velox source tree instead of the
+        default ../velox sibling. The path must be inside the Docker build
+        context root. Can also be set with PRESTO_DEV_VELOX_SOURCE.
 
 START_OPTIONS:
     Accepts the same CPU options as start_native_cpu_presto.sh, including:
@@ -75,6 +80,7 @@ Examples:
     $0 -w 2 --wait --no-cache -b worker --restart-target worker
     $0 -w 2 --wait -b coordinator --restart-target coordinator --skip-ui
     $0 -w 2 --wait -b coordinator --restart-target coordinator --skip-ui --dev-presto-dependencies
+    $0 -w 2 --wait -b worker --restart-target worker --velox-source ../../velox-ucx
     $0 -w 2 --wait --restart-target none
     $0 -w 2 -b worker --restart-target none
 
@@ -129,6 +135,10 @@ while [[ $# -gt 0 ]]; do
       DEV_PRESTO_DEPENDENCIES=true
       shift
       ;;
+    --velox-source)
+      DEV_VELOX_SOURCE=${2:?Error: --velox-source requires a value}
+      shift 2
+      ;;
     *)
       DEV_ARGS+=("$1")
       shift
@@ -151,6 +161,14 @@ if [[ ! ${DEV_RESTART_TARGET} =~ ^(all|coordinator|worker|none)$ ]]; then
   exit 1
 fi
 
+if [[ -n "$DEV_VELOX_SOURCE" ]]; then
+  DEV_VELOX_SOURCE="$(cd "$DEV_VELOX_SOURCE" && pwd)"
+  if [[ ! -f "${DEV_VELOX_SOURCE}/CMakeLists.txt" || ! -d "${DEV_VELOX_SOURCE}/velox" ]]; then
+    echo "ERROR: --velox-source must point to a Velox source tree." >&2
+    exit 1
+  fi
+fi
+
 if [[ "$DEV_CLEAN_FIRST" == "true" && "$DEV_RESTART_TARGET" =~ ^(worker|none)$ ]]; then
   echo "ERROR: --clean-first removes the coordinator, so --restart-target ${DEV_RESTART_TARGET} cannot produce a usable cluster." >&2
   echo "Use --restart-target all with --clean-first, or omit --clean-first for the fast path." >&2
@@ -165,8 +183,16 @@ set +u
 source "${SCRIPT_DIR}/start_presto_helper_parse_args.sh"
 set -u
 
+function effective_velox_source() {
+  if [[ -n "$DEV_VELOX_SOURCE" ]]; then
+    echo "$DEV_VELOX_SOURCE"
+  else
+    echo "${REPO_ROOT}/../velox"
+  fi
+}
+
 function validate_sibling_repos() {
-  "${REPO_ROOT}/scripts/validate_directories_exist.sh" "${REPO_ROOT}/../presto" "${REPO_ROOT}/../velox"
+  "${REPO_ROOT}/scripts/validate_directories_exist.sh" "${REPO_ROOT}/../presto" "$(effective_velox_source)"
 }
 
 function validate_sccache_auth() {
@@ -242,12 +268,15 @@ function emit_git_hash_input() {
 function compute_source_hash() {
   {
     emit_git_hash_input "${REPO_ROOT}/../presto" "presto"
-    emit_git_hash_input "${REPO_ROOT}/../velox" "velox"
+    emit_git_hash_input "$(effective_velox_source)" "velox"
   } | sha256sum | awk '{print $1}'
 }
 
 function compute_native_build_cache_scope() {
-  realpath "${REPO_ROOT}" | sha256sum | awk '{print substr($1, 1, 16)}'
+  {
+    realpath "${REPO_ROOT}"
+    realpath "$(effective_velox_source)"
+  } | sha256sum | awk '{print substr($1, 1, 16)}'
 }
 
 function compute_presto_package_hash() {
@@ -371,6 +400,7 @@ function apply_dev_discovery_tuning() {
   local failure_heartbeat="${PRESTO_DEV_FAILURE_DETECTOR_HEARTBEAT:-250ms}"
   local failure_warmup="${PRESTO_DEV_FAILURE_DETECTOR_WARMUP:-1s}"
   local failure_decay="${PRESTO_DEV_FAILURE_DETECTOR_DECAY_SECONDS:-1}"
+  local failure_expiration_grace="${PRESTO_DEV_FAILURE_DETECTOR_EXPIRATION_GRACE:-3s}"
   local worker_announcement_ms="${PRESTO_DEV_ANNOUNCEMENT_MAX_FREQUENCY_MS:-1000}"
 
   set_properties_file_value "discovery.max-age" "$discovery_max_age" "$coordinator_config"
@@ -379,6 +409,7 @@ function apply_dev_discovery_tuning() {
   set_properties_file_value "failure-detector.heartbeat-interval" "$failure_heartbeat" "$coordinator_config"
   set_properties_file_value "failure-detector.warmup-interval" "$failure_warmup" "$coordinator_config"
   set_properties_file_value "failure-detector.exponential-decay-seconds" "$failure_decay" "$coordinator_config"
+  set_properties_file_value "failure-detector.expiration-grace-interval" "$failure_expiration_grace" "$coordinator_config"
 
   local worker_config
   for worker_config in "${config_dir}"/etc_worker*/config_native.properties; do
@@ -386,7 +417,7 @@ function apply_dev_discovery_tuning() {
     set_properties_file_value "announcement-max-frequency-ms" "$worker_announcement_ms" "$worker_config"
   done
 
-  echo "Dev discovery tuning: discovery.max-age=${discovery_max_age} discovery.store-cache-ttl=${discovery_store_cache_ttl} node-discovery-poll-ms=${node_discovery_poll_ms} worker-announcement-ms=${worker_announcement_ms}"
+  echo "Dev discovery tuning: discovery.max-age=${discovery_max_age} discovery.store-cache-ttl=${discovery_store_cache_ttl} node-discovery-poll-ms=${node_discovery_poll_ms} failure-expiration-grace=${failure_expiration_grace} worker-announcement-ms=${worker_announcement_ms}"
 }
 
 function apply_dev_node_addresses() {
@@ -584,6 +615,72 @@ function render_dev_coordinator_override() {
   echo "$override_path"
 }
 
+function render_dev_velox_source_dockerfile() {
+  local rendered_dir=$1
+  local velox_source=$2
+  local dockerfile_path="${rendered_dir}/native_build.velox_source.dockerfile"
+  local source_dockerfile="${SCRIPT_DIR}/../docker/native_build.dockerfile"
+  local tmp_dockerfile="${dockerfile_path}.tmp"
+  local context_root
+  local relative_velox_source
+
+  if [[ ! -f "$source_dockerfile" ]]; then
+    echo "ERROR: native build Dockerfile not found: ${source_dockerfile}" >&2
+    exit 1
+  fi
+  if ! grep -Fq "source=velox,target=/presto_native_staging/presto/velox" "$source_dockerfile"; then
+    echo "ERROR: native build Dockerfile no longer has the expected Velox bind mount: ${source_dockerfile}" >&2
+    exit 1
+  fi
+
+  context_root="$(cd "${REPO_ROOT}/.." && pwd)"
+  relative_velox_source="$(realpath --relative-to="$context_root" "$velox_source")"
+  if [[ "$relative_velox_source" == ".." || "$relative_velox_source" == ../* || "$relative_velox_source" == /* ]]; then
+    echo "ERROR: --velox-source must be inside the Docker build context root: ${context_root}" >&2
+    exit 1
+  fi
+  if [[ "$relative_velox_source" =~ [[:space:]] ]]; then
+    echo "ERROR: --velox-source path cannot contain whitespace: ${velox_source}" >&2
+    exit 1
+  fi
+
+  sed \
+    -e "s+source=velox,target=/presto_native_staging/presto/velox+source=${relative_velox_source},target=/presto_native_staging/presto/velox+" \
+    "$source_dockerfile" > "$tmp_dockerfile"
+  if [[ ! -s "$tmp_dockerfile" ]]; then
+    echo "ERROR: generated alternate Velox native build Dockerfile is empty." >&2
+    rm -f "$tmp_dockerfile"
+    exit 1
+  fi
+  mv "$tmp_dockerfile" "$dockerfile_path"
+  echo "$dockerfile_path"
+}
+
+function render_dev_velox_source_override() {
+  local rendered_dir=$1
+  local override_path="${rendered_dir}/docker-compose.cpu-dev-velox-source.yml"
+  local dockerfile_path
+  local dockerfile_in_context
+  local worker_services=()
+  local service
+
+  mkdir -p "$rendered_dir"
+  dockerfile_path="$(render_dev_velox_source_dockerfile "$rendered_dir" "$DEV_VELOX_SOURCE")"
+  dockerfile_in_context="velox-testing/presto/docker/docker-compose/generated/$(basename "$dockerfile_path")"
+  mapfile -t worker_services < <(cpu_worker_services)
+
+  {
+    printf "services:\n"
+    for service in "${worker_services[@]}"; do
+      printf "  %s:\n" "$service"
+      printf "    build:\n"
+      printf "      dockerfile: %s\n" "$dockerfile_in_context"
+    done
+  } > "$override_path"
+
+  echo "$override_path"
+}
+
 function build_targets_include() {
   local service=$1
   local target
@@ -666,6 +763,11 @@ fi
 if build_targets_include "$COORDINATOR_SERVICE"; then
   COORDINATOR_DEV_OVERRIDE_PATH="$(render_dev_coordinator_override "$RENDERED_DIR")"
   COMPOSE_FILE_ARGS+=(-f "$COORDINATOR_DEV_OVERRIDE_PATH")
+fi
+if build_targets_include_cpu_worker && [[ -n "$DEV_VELOX_SOURCE" ]]; then
+  VELOX_SOURCE_OVERRIDE_PATH="$(render_dev_velox_source_override "$RENDERED_DIR")"
+  COMPOSE_FILE_ARGS+=(-f "$VELOX_SOURCE_OVERRIDE_PATH")
+  echo "Using alternate Velox source for native worker build: ${DEV_VELOX_SOURCE}"
 fi
 if [[ "$DEV_RESTART_TARGET" != "none" || "$WAIT_FOR_WORKERS" == "true" ]]; then
   DEV_NETWORK_OVERRIDE_PATH="$(render_dev_network_override "$RENDERED_DIR")"
@@ -809,16 +911,19 @@ missing = [
     for service, alternatives in expected
     if not any(url in node_text for url in alternatives)
 ]
+unexpected_count = isinstance(nodes, list) and len(nodes) != len(expected)
 unexpected = sorted(
     url for url in observed_urls
     if str(urlparse(url).port) in worker_ports and url not in valid_urls
 )
 
-if missing or unexpected:
+if missing or unexpected or unexpected_count:
     if quiet:
         sys.exit(1)
 
     print("ERROR: coordinator node view does not match the current worker containers.", file=sys.stderr)
+    if unexpected_count:
+        print(f"  expected exactly {len(expected)} worker nodes, but coordinator reports {len(nodes)}", file=sys.stderr)
     for service, alternatives in missing:
         print(f"  missing {service}: expected one of {', '.join(alternatives)}", file=sys.stderr)
     for url in unexpected:

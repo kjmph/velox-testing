@@ -313,6 +313,14 @@ if [[ "${VARIANT_TYPE}" == "cpu" ]]; then
     "node-scheduler.max-splits-per-task" \
     "${CPU_MAX_SPLITS_PER_TASK}" \
     "${CONFIG_DIR}/etc_coordinator/config_native.properties"
+  set_or_append \
+    "exchange.max-buffer-size" \
+    "${CPU_EXCHANGE_BUFFER}" \
+    "${CONFIG_DIR}/etc_coordinator/config_native.properties"
+  set_or_append \
+    "sink.max-buffer-size" \
+    "${CPU_SINK_BUFFER}" \
+    "${CONFIG_DIR}/etc_coordinator/config_native.properties"
   # Apply to every CPU worker config dir: etc_worker (single-worker + template
   # for duplicate_worker_configs) plus etc_worker_<N> (multi-worker instances).
   for worker_dir in "${CONFIG_DIR}"/etc_worker*/; do
@@ -340,4 +348,16 @@ if [[ "${VARIANT_TYPE}" == "cpu" ]]; then
     [[ -f "$hive_cfg" ]] || continue
     sed -i 's/^hive.file-splittable=false/hive.file-splittable=true/' "$hive_cfg"
   done
+
+  # CPU row exchange is still sensitive to coordinator placement for ordered
+  # multi-stage plans. Keep CPU on the historical soft-affinity placement while
+  # GPU runs can opt out via the shared template default.
+  cpu_coord_hive="${CONFIG_DIR}/etc_coordinator/catalog/hive.properties"
+  if [[ -f "$cpu_coord_hive" ]]; then
+    if grep -q '^# hive.node-selection-strategy=SOFT_AFFINITY' "$cpu_coord_hive"; then
+      sed -i 's/^# hive.node-selection-strategy=SOFT_AFFINITY/hive.node-selection-strategy=SOFT_AFFINITY/' "$cpu_coord_hive"
+    else
+      set_or_append "hive.node-selection-strategy" "SOFT_AFFINITY" "$cpu_coord_hive"
+    fi
+  fi
 fi

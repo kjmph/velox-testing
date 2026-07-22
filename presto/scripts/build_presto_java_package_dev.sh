@@ -18,7 +18,8 @@ DEV_CLEAN="${PRESTO_DEV_JAVA_CLEAN:-false}"
 DEV_REBUILD_BUILDER="${PRESTO_DEV_REBUILD_JAVA_BUILDER:-false}"
 DEV_PRESTO_DEPENDENCIES="${PRESTO_DEV_PRESTO_DEPENDENCIES:-false}"
 DEV_MAVEN_PROJECTS="${PRESTO_DEV_MAVEN_PROJECTS:-}"
-DEV_PRESTO_DEPENDENCIES_PROJECTS="${PRESTO_DEV_PRESTO_DEPENDENCIES_PROJECTS:-:presto-server,:presto-cli,:presto-function-server}"
+DEV_PRESTO_DEPENDENCIES_PROJECTS="${PRESTO_DEV_PRESTO_DEPENDENCIES_PROJECTS:-}"
+DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS=""
 DEV_BUILDER_IMAGE="${PRESTO_DEV_JAVA_BUILDER_IMAGE:-presto-java-builder-dev:${USER:-latest}-jdk17-git-v1}"
 
 print_help() {
@@ -59,7 +60,10 @@ Environment:
                                   ":presto-server,:presto-cli,:presto-function-server"
     PRESTO_DEV_PRESTO_DEPENDENCIES_PROJECTS
                                   Override the project list used by
-                                  --dev-presto-dependencies.
+                                  --dev-presto-dependencies. By default this
+                                  is derived from presto-server's Provisio
+                                  runtime descriptor so cold Maven caches build
+                                  the plugin ZIPs the server package resolves.
 
 EOF
 }
@@ -80,6 +84,46 @@ normalize_bool() {
       return 1
       ;;
   esac
+}
+
+compute_presto_dependencies_projects() {
+  local presto_root="${REPO_ROOT}/../presto"
+  local provisio_file="${presto_root}/presto-server/src/main/provisio/presto.xml"
+  local -a projects=(
+    "presto-server"
+    "presto-cli"
+    "presto-function-server"
+  )
+  local artifact
+  local seen
+  declare -A seen=()
+
+  if [[ ! -f "$provisio_file" ]]; then
+    echo "ERROR: expected Presto server runtime descriptor is missing: ${provisio_file}" >&2
+    return 1
+  fi
+
+  while IFS= read -r artifact; do
+    projects+=("$artifact")
+  done < <(
+    sed -n 's/.*artifact id="${project\.groupId}:\([^:"]*\):.*${project\.version}".*/\1/p' "$provisio_file"
+  )
+
+  local -a project_refs=()
+  for artifact in "${projects[@]}"; do
+    if [[ -n "${seen[$artifact]:-}" ]]; then
+      continue
+    fi
+    seen[$artifact]=1
+    if [[ ! -d "${presto_root}/${artifact}" ]]; then
+      echo "ERROR: ${provisio_file} references ${artifact}, but ${presto_root}/${artifact} does not exist." >&2
+      return 1
+    fi
+    project_refs+=(":${artifact}")
+  done
+
+  local IFS=,
+  echo "${project_refs[*]}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -129,10 +173,28 @@ if ! DEV_PRESTO_DEPENDENCIES="$(normalize_bool "$DEV_PRESTO_DEPENDENCIES" "PREST
   exit 1
 fi
 if [[ "$DEV_PRESTO_DEPENDENCIES" == true && -z "$DEV_MAVEN_PROJECTS" ]]; then
+  if [[ -z "$DEV_PRESTO_DEPENDENCIES_PROJECTS" ]]; then
+    DEV_PRESTO_DEPENDENCIES_PROJECTS="$(compute_presto_dependencies_projects)"
+  fi
   DEV_MAVEN_PROJECTS="$DEV_PRESTO_DEPENDENCIES_PROJECTS"
 fi
+if [[ "$DEV_PRESTO_DEPENDENCIES" == true ]]; then
+  IFS=, read -r -a dev_projects <<< "$DEV_MAVEN_PROJECTS"
+  dev_bootstrap_projects=()
+  for project in "${dev_projects[@]}"; do
+    [[ "$project" == ":presto-server" ]] && continue
+    dev_bootstrap_projects+=("$project")
+  done
+  if (( ${#dev_bootstrap_projects[@]} )); then
+    DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS="$(IFS=,; echo "${dev_bootstrap_projects[*]}")"
+  fi
+fi
 
-MAVEN_CACHE_DIR="${PRESTO_DEV_MAVEN_CACHE_DIR:-${SCRIPT_DIR}/.mvn_cache}"
+DEFAULT_MAVEN_CACHE_DIR="${SCRIPT_DIR}/.mvn_cache"
+if [[ -d "${HOME}/.m2/repository" ]]; then
+  DEFAULT_MAVEN_CACHE_DIR="${HOME}/.m2"
+fi
+MAVEN_CACHE_DIR="${PRESTO_DEV_MAVEN_CACHE_DIR:-${DEFAULT_MAVEN_CACHE_DIR}}"
 mkdir -p "$MAVEN_CACHE_DIR"
 
 image_missing() {
@@ -175,6 +237,7 @@ docker run --rm \
   -e "PRESTO_DEV_SKIP_UI=${DEV_SKIP_UI}" \
   -e "PRESTO_DEV_JAVA_CLEAN=${DEV_CLEAN}" \
   -e "PRESTO_DEV_MAVEN_PROJECTS=${DEV_MAVEN_PROJECTS}" \
+  -e "PRESTO_DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS=${DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS}" \
   -w /presto \
   "$DEV_BUILDER_IMAGE" \
   bash -lc '
@@ -182,18 +245,19 @@ docker run --rm \
 
     git config --global --add safe.directory /presto
 
-    maven_args=(
+    maven_common_args=(
       --no-transfer-progress
       -DskipTests
       -Dair.check.skip-all=true
     )
+    maven_project_args=()
     if [[ -n "${PRESTO_DEV_MAVEN_PROJECTS}" ]]; then
-      maven_args+=(-pl "${PRESTO_DEV_MAVEN_PROJECTS}" -am)
+      maven_project_args+=(-pl "${PRESTO_DEV_MAVEN_PROJECTS}" -am)
     else
-      maven_args+=(-pl "!presto-docs" -pl "!presto-openapi")
+      maven_project_args+=(-pl "!presto-docs" -pl "!presto-openapi")
     fi
     if [[ "${PRESTO_DEV_SKIP_UI}" == "true" ]]; then
-      maven_args+=(-DskipUI)
+      maven_common_args+=(-DskipUI)
     fi
 
     rm -f \
@@ -205,10 +269,15 @@ docker run --rm \
       presto-function-server/target/presto-function-server-*executable.jar \
       presto-cli/target/presto-cli-*-executable.jar
 
+    if [[ -n "${PRESTO_DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS}" ]]; then
+      echo "Dev Java build: pre-installing server runtime artifacts from ${PRESTO_DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS}."
+      ./mvnw install "${maven_common_args[@]}" -pl "${PRESTO_DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS}" -am
+    fi
+
     if [[ "${PRESTO_DEV_JAVA_CLEAN}" == "true" ]]; then
-      ./mvnw clean install "${maven_args[@]}"
+      ./mvnw clean install "${maven_common_args[@]}" "${maven_project_args[@]}"
     else
-      ./mvnw install "${maven_args[@]}"
+      ./mvnw install "${maven_common_args[@]}" "${maven_project_args[@]}"
     fi
 
     echo "Copying artifacts with version ${PRESTO_VERSION}..."
@@ -216,6 +285,17 @@ docker run --rm \
     cp presto-function-server/target/presto-function-server-*executable.jar docker/presto-function-server-executable.jar
     cp presto-function-server/target/presto-function-server-*executable.jar "docker/presto-function-server-${PRESTO_VERSION}-executable.jar"
     cp presto-cli/target/presto-cli-*-executable.jar "docker/presto-cli-${PRESTO_VERSION}-executable.jar"
-    chmod +r "docker/presto-cli-${PRESTO_VERSION}-executable.jar"
+
+    artifact_owner="$(stat -c "%u:%g" docker)"
+    chown "${artifact_owner}" \
+      "docker/presto-server-${PRESTO_VERSION}.tar.gz" \
+      docker/presto-function-server-executable.jar \
+      "docker/presto-function-server-${PRESTO_VERSION}-executable.jar" \
+      "docker/presto-cli-${PRESTO_VERSION}-executable.jar"
+    chmod u+rw,go+r \
+      "docker/presto-server-${PRESTO_VERSION}.tar.gz" \
+      docker/presto-function-server-executable.jar \
+      "docker/presto-function-server-${PRESTO_VERSION}-executable.jar" \
+      "docker/presto-cli-${PRESTO_VERSION}-executable.jar"
     echo "Build complete. Artifacts copied with version ${PRESTO_VERSION}."
   '

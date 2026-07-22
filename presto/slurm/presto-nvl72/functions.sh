@@ -174,6 +174,14 @@ function run_worker {
     mkdir -p ${worker_data}/hive/data/user_data
     mkdir -p ${VT_ROOT}/.hive_metastore
 
+    local driver_mounts=""
+    if [[ -n "${CLUSTER_LIBCUDA_HOST_PATH:-}" && -n "${CLUSTER_LIBCUDA_CONTAINER_PATH:-}" ]]; then
+        driver_mounts="${driver_mounts},${CLUSTER_LIBCUDA_HOST_PATH}:${CLUSTER_LIBCUDA_CONTAINER_PATH}"
+    fi
+    if [[ -n "${CLUSTER_LIBNVIDIA_ML_HOST_PATH:-}" && -n "${CLUSTER_LIBNVIDIA_ML_CONTAINER_PATH:-}" ]]; then
+        driver_mounts="${driver_mounts},${CLUSTER_LIBNVIDIA_ML_HOST_PATH}:${CLUSTER_LIBNVIDIA_ML_CONTAINER_PATH}"
+    fi
+
     # Need to fix this to run with cpu nodes as well.
     # Run the worker with the new configs.
     # Use --overlap to allow multiple srun commands from same job
@@ -181,7 +189,7 @@ function run_worker {
     # Set CUDA_VISIBLE_DEVICES explicitly in bash command to override SLURM default
     srun -N1 -w $node --ntasks=1 --overlap \
 --container-image=${worker_image} \
---export=ALL \
+--export=ALL,NVIDIA_VISIBLE_DEVICES=all,NVIDIA_DRIVER_CAPABILITIES=compute,utility,MELLANOX_VISIBLE_DEVICES=all \
 --container-env=LD_LIBRARY_PATH="/usr/lib64/presto-native-libs:/usr/local/lib:/usr/lib64" \
 --container-mounts=${VT_ROOT}:/workspace,\
 ${CONFIGS}/etc_common:/opt/presto-server/etc,\
@@ -190,7 +198,7 @@ ${worker_config}:/opt/presto-server/etc/config.properties,\
 ${worker_hive}:/opt/presto-server/etc/catalog/hive.properties,\
 ${worker_data}:/var/lib/presto/data,\
 ${DATA}:/var/lib/presto/data/hive/data/user_data,\
-${VT_ROOT}/.hive_metastore:/var/lib/presto/data/hive/metastore \
+${VT_ROOT}/.hive_metastore:/var/lib/presto/data/hive/metastore${driver_mounts} \
 --container-env=LD_LIBRARY_PATH="$CUDF_LIB:$LD_LIBRARY_PATH" \
 --container-env=GLOG_vmodule=IntraNodeTransferRegistry=3,ExchangeOperator=3 \
 --container-env=GLOG_logtostderr=1 \
