@@ -172,6 +172,41 @@ else
   echo_success "Reusing existing Presto Config files for '${VARIANT_TYPE}'"
 fi
 
+# A replicated cuDF join builds a full copy on every GPU. The generated limit is
+# based on host RAM, which can be much larger than device memory and can make a
+# very large, narrow relation look safe to broadcast. Cap the GPU variant at the
+# lesser of 4GB or 5% of the smallest device's memory. Set
+# GPU_JOIN_MAX_BROADCAST_TABLE_SIZE to override this calculation.
+if [[ "${VARIANT_TYPE}" == "gpu" ]]; then
+  GPU_COORD_CONFIG="${CONFIG_DIR}/etc_coordinator/config_native.properties"
+  if [[ -n "${GPU_JOIN_MAX_BROADCAST_TABLE_SIZE:-}" ]]; then
+    GPU_JOIN_BROADCAST_LIMIT="${GPU_JOIN_MAX_BROADCAST_TABLE_SIZE}"
+  else
+    GPU_MEMORY_MB=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      GPU_MEMORY_MB=$({ nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null || true; } |
+        awk '$1 ~ /^[0-9]+$/ { if (!minimum || $1 < minimum) minimum=$1 } END { if (minimum) print minimum }')
+    fi
+
+    if [[ -n "${GPU_MEMORY_MB}" ]]; then
+      GPU_JOIN_BROADCAST_LIMIT_MB=$(( GPU_MEMORY_MB / 20 ))
+      [[ ${GPU_JOIN_BROADCAST_LIMIT_MB} -gt 4096 ]] && GPU_JOIN_BROADCAST_LIMIT_MB=4096
+      [[ ${GPU_JOIN_BROADCAST_LIMIT_MB} -lt 100 ]] && GPU_JOIN_BROADCAST_LIMIT_MB=100
+
+      GPU_JOIN_BROADCAST_LIMIT="${GPU_JOIN_BROADCAST_LIMIT_MB}MB"
+    else
+      GPU_JOIN_BROADCAST_LIMIT="1GB"
+      echo_warning "Could not query GPU memory; defaulting join-max-broadcast-table-size to ${GPU_JOIN_BROADCAST_LIMIT}"
+    fi
+  fi
+
+  if [[ ! "${GPU_JOIN_BROADCAST_LIMIT}" =~ ^[1-9][0-9]*(KB|MB|GB|TB)$ ]]; then
+    echo_error "ERROR: GPU_JOIN_MAX_BROADCAST_TABLE_SIZE must be an integer data size such as 1024MB or 4GB."
+  fi
+  sed -i "s/^join-max-broadcast-table-size=.*/join-max-broadcast-table-size=${GPU_JOIN_BROADCAST_LIMIT}/" "${GPU_COORD_CONFIG}"
+  echo "GPU auto-tune: join-max-broadcast-table-size=${GPU_JOIN_BROADCAST_LIMIT}"
+fi
+
 # We want to propagate any changes from the original worker config to the new worker configs even if
 # we did not re-generate the configs.
 #
