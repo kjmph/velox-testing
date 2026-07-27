@@ -21,6 +21,7 @@ DEV_MAVEN_PROJECTS="${PRESTO_DEV_MAVEN_PROJECTS:-}"
 DEV_PRESTO_DEPENDENCIES_PROJECTS="${PRESTO_DEV_PRESTO_DEPENDENCIES_PROJECTS:-}"
 DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS=""
 DEV_BUILDER_IMAGE="${PRESTO_DEV_JAVA_BUILDER_IMAGE:-presto-java-builder-dev:${USER:-latest}-jdk17-git-v1}"
+DEV_PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-${REPO_ROOT}/../presto}"
 
 print_help() {
   cat << EOF
@@ -64,6 +65,8 @@ Environment:
                                   is derived from presto-server's Provisio
                                   runtime descriptor so cold Maven caches build
                                   the plugin ZIPs the server package resolves.
+    PRESTO_DEV_PRESTO_SOURCE      Build from this Presto source tree instead
+                                  of the default ../presto sibling.
 
 EOF
 }
@@ -87,7 +90,7 @@ normalize_bool() {
 }
 
 compute_presto_dependencies_projects() {
-  local presto_root="${REPO_ROOT}/../presto"
+  local presto_root="$DEV_PRESTO_SOURCE"
   local provisio_file="${presto_root}/presto-server/src/main/provisio/presto.xml"
   local -a projects=(
     "presto-server"
@@ -172,6 +175,70 @@ fi
 if ! DEV_PRESTO_DEPENDENCIES="$(normalize_bool "$DEV_PRESTO_DEPENDENCIES" "PRESTO_DEV_PRESTO_DEPENDENCIES")"; then
   exit 1
 fi
+if [[ ! -d "$DEV_PRESTO_SOURCE" ]]; then
+  echo "ERROR: PRESTO_DEV_PRESTO_SOURCE does not exist: ${DEV_PRESTO_SOURCE}" >&2
+  exit 1
+fi
+DEV_PRESTO_SOURCE="$(cd "$DEV_PRESTO_SOURCE" && pwd)"
+if [[ ! -f "${DEV_PRESTO_SOURCE}/pom.xml" ||
+      ! -d "${DEV_PRESTO_SOURCE}/presto-server" ||
+      ! -d "${DEV_PRESTO_SOURCE}/presto-native-execution" ||
+      ! -d "${DEV_PRESTO_SOURCE}/docker" ]]; then
+  echo "ERROR: PRESTO_DEV_PRESTO_SOURCE must point to a Presto source tree: ${DEV_PRESTO_SOURCE}" >&2
+  exit 1
+fi
+
+PRESTO_CONTAINER_SOURCE="$DEV_PRESTO_SOURCE"
+PRESTO_GIT_MOUNT_ARGS=()
+if [[ -f "${DEV_PRESTO_SOURCE}/.git" ]]; then
+  IFS= read -r presto_gitdir_line < "${DEV_PRESTO_SOURCE}/.git"
+  if [[ "$presto_gitdir_line" != "gitdir: "* ]]; then
+    echo "ERROR: unsupported linked-worktree .git file: ${DEV_PRESTO_SOURCE}/.git" >&2
+    exit 1
+  fi
+
+  PRESTO_RECORDED_GIT_DIR="${presto_gitdir_line#gitdir: }"
+  if [[ "$PRESTO_RECORDED_GIT_DIR" != /* ]]; then
+    PRESTO_RECORDED_GIT_DIR="$(realpath -m "${DEV_PRESTO_SOURCE}/${PRESTO_RECORDED_GIT_DIR}")"
+  fi
+
+  PRESTO_HOST_GIT_DIR="$PRESTO_RECORDED_GIT_DIR"
+  if [[ ! -d "$PRESTO_HOST_GIT_DIR" ]]; then
+    # The worktree may have been created in a different mount namespace. For
+    # example, the gitfile can record /home/user/... while the host-side
+    # launcher sees the same workspace under /raid/user/home/....
+    presto_recorded_common_guess="$(dirname "$(dirname "$PRESTO_RECORDED_GIT_DIR")")"
+    presto_main_worktree_name="$(basename "$(dirname "$presto_recorded_common_guess")")"
+    presto_worktree_name="$(basename "$PRESTO_RECORDED_GIT_DIR")"
+    presto_host_git_dir_candidate="$(dirname "$DEV_PRESTO_SOURCE")/${presto_main_worktree_name}/.git/worktrees/${presto_worktree_name}"
+    if [[ ! -d "$presto_host_git_dir_candidate" ]]; then
+      echo "ERROR: unable to resolve linked-worktree Git metadata recorded as ${PRESTO_RECORDED_GIT_DIR}." >&2
+      echo "Checked host-side candidate: ${presto_host_git_dir_candidate}" >&2
+      exit 1
+    fi
+    PRESTO_HOST_GIT_DIR="$(cd "$presto_host_git_dir_candidate" && pwd)"
+  fi
+
+  if [[ ! -f "${PRESTO_HOST_GIT_DIR}/commondir" || ! -f "${PRESTO_HOST_GIT_DIR}/gitdir" ]]; then
+    echo "ERROR: incomplete linked-worktree Git metadata: ${PRESTO_HOST_GIT_DIR}" >&2
+    exit 1
+  fi
+
+  IFS= read -r presto_commondir < "${PRESTO_HOST_GIT_DIR}/commondir"
+  PRESTO_HOST_GIT_COMMON_DIR="$(cd "${PRESTO_HOST_GIT_DIR}/${presto_commondir}" && pwd)"
+  PRESTO_CONTAINER_GIT_COMMON_DIR="$(realpath -m "${PRESTO_RECORDED_GIT_DIR}/${presto_commondir}")"
+
+  IFS= read -r presto_recorded_gitfile < "${PRESTO_HOST_GIT_DIR}/gitdir"
+  if [[ "$presto_recorded_gitfile" != /*/.git ]]; then
+    echo "ERROR: unsupported linked-worktree gitfile backlink: ${presto_recorded_gitfile}" >&2
+    exit 1
+  fi
+  PRESTO_CONTAINER_SOURCE="${presto_recorded_gitfile%/.git}"
+  PRESTO_GIT_MOUNT_ARGS+=(
+    -v "${PRESTO_HOST_GIT_COMMON_DIR}:${PRESTO_CONTAINER_GIT_COMMON_DIR}:ro"
+  )
+fi
+
 if [[ "$DEV_PRESTO_DEPENDENCIES" == true && -z "$DEV_MAVEN_PROJECTS" ]]; then
   if [[ -z "$DEV_PRESTO_DEPENDENCIES_PROJECTS" ]]; then
     DEV_PRESTO_DEPENDENCIES_PROJECTS="$(compute_presto_dependencies_projects)"
@@ -216,6 +283,10 @@ DOCKERFILE
 }
 
 echo "Building Presto Java dev package with PRESTO_VERSION: $PRESTO_VERSION"
+echo "Using Presto source: ${DEV_PRESTO_SOURCE}"
+if [[ "$PRESTO_CONTAINER_SOURCE" != "$DEV_PRESTO_SOURCE" ]]; then
+  echo "Mapping linked Presto worktree into builder: ${DEV_PRESTO_SOURCE} -> ${PRESTO_CONTAINER_SOURCE}"
+fi
 if [[ "$DEV_SKIP_UI" == true ]]; then
   echo "Dev Java build: skipping presto-ui (-DskipUI)."
 else
@@ -231,19 +302,22 @@ fi
 ensure_builder_image
 
 docker run --rm \
-  -v "${REPO_ROOT}/../presto:/presto" \
+  -v "${DEV_PRESTO_SOURCE}:${PRESTO_CONTAINER_SOURCE}" \
+  "${PRESTO_GIT_MOUNT_ARGS[@]}" \
   -v "${MAVEN_CACHE_DIR}:/root/.m2" \
+  -e "GIT_OPTIONAL_LOCKS=0" \
   -e "PRESTO_VERSION=${PRESTO_VERSION}" \
+  -e "PRESTO_DEV_PRESTO_SOURCE=${PRESTO_CONTAINER_SOURCE}" \
   -e "PRESTO_DEV_SKIP_UI=${DEV_SKIP_UI}" \
   -e "PRESTO_DEV_JAVA_CLEAN=${DEV_CLEAN}" \
   -e "PRESTO_DEV_MAVEN_PROJECTS=${DEV_MAVEN_PROJECTS}" \
   -e "PRESTO_DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS=${DEV_PRESTO_DEPENDENCIES_BOOTSTRAP_PROJECTS}" \
-  -w /presto \
+  -w "$PRESTO_CONTAINER_SOURCE" \
   "$DEV_BUILDER_IMAGE" \
   bash -lc '
     set -euo pipefail
 
-    git config --global --add safe.directory /presto
+    git config --global --add safe.directory "${PRESTO_DEV_PRESTO_SOURCE}"
 
     maven_common_args=(
       --no-transfer-progress

@@ -8,6 +8,8 @@ IMAGE_NAME="presto/prestissimo-dependency:centos9-${USER:-latest}"
 NO_CACHE_ARG=''
 UCX_SOURCE=''
 UCX_SOURCE_HASH=''
+PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
+VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 
 print_help() {
   cat << EOF
@@ -15,8 +17,8 @@ print_help() {
 Usage: build_centos_deps_image.sh [OPTIONS]
 
 This script does a local build of a Presto dependencies/run-time container to a Docker image.
-It expects sibling Presto and Velox clones, and will override the Presto Velox dependencies
-scripts and CMake config to be those of the sibling Velox.
+It uses selected Presto and Velox source trees and temporarily overrides the
+Presto native module's Velox dependency scripts and CMake configuration.
 
 If an image of the given name already exists, it is left in place until the new
 build succeeds and is retagged.
@@ -25,7 +27,17 @@ OPTIONS:
     -h, --help           Show this help message
     -i, --image-name     Desired Docker Image name (default: presto/prestissimo-dependency:centos9-\${USER:-latest})
     -n, --no-cache       Do not use Docker build cache (default: use cache)
-    --ucx-source         Local UCX source tree to build into the dependency image
+    --presto-source PATH Presto source tree whose native dependency image
+                         definition should be built (default: ../presto)
+    --velox-source PATH  Velox source tree providing dependency setup scripts
+                         and CMake modules (default: ../velox)
+    --ucx-source PATH    Local UCX source tree to build into the dependency image
+
+Environment:
+    PRESTO_DEV_PRESTO_SOURCE
+                         Same as --presto-source.
+    PRESTO_DEV_VELOX_SOURCE
+                         Same as --velox-source.
 
 EOF
 }
@@ -49,6 +61,24 @@ parse_args() {
       -n|--no-cache)
         NO_CACHE_ARG="--no-cache"
         shift
+        ;;
+      --presto-source)
+        if [[ -n $2 ]]; then
+          PRESTO_SOURCE=$2
+          shift 2
+        else
+          echo "Error: --presto-source requires a value"
+          exit 1
+        fi
+        ;;
+      --velox-source)
+        if [[ -n $2 ]]; then
+          VELOX_SOURCE=$2
+          shift 2
+        else
+          echo "Error: --velox-source requires a value"
+          exit 1
+        fi
         ;;
       --ucx-source)
         if [[ -n $2 ]]; then
@@ -76,11 +106,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Get the root of the git repository
 REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
 
-# verify sibling Presto and Velox clones
-if [[ ! -d "${REPO_ROOT}/../presto/presto-native-execution" || ! -d "${REPO_ROOT}/../velox" ]]; then
-  echo "Error: Sibling Presto and/or Velox clone not found"
+# Resolve and verify the selected Presto and Velox clones.
+PRESTO_SOURCE="${PRESTO_SOURCE:-${REPO_ROOT}/../presto}"
+VELOX_SOURCE="${VELOX_SOURCE:-${REPO_ROOT}/../velox}"
+if [[ ! -d "$PRESTO_SOURCE" ]]; then
+  echo "Error: Presto source tree not found: ${PRESTO_SOURCE}"
   exit 1
 fi
+if [[ ! -d "$VELOX_SOURCE" ]]; then
+  echo "Error: Velox source tree not found: ${VELOX_SOURCE}"
+  exit 1
+fi
+PRESTO_SOURCE="$(cd "$PRESTO_SOURCE" && pwd)"
+VELOX_SOURCE="$(cd "$VELOX_SOURCE" && pwd)"
+if [[ ! -f "${PRESTO_SOURCE}/pom.xml" ||
+      ! -f "${PRESTO_SOURCE}/presto-native-execution/docker-compose.yml" ]]; then
+  echo "Error: --presto-source must point to a Presto source tree: ${PRESTO_SOURCE}"
+  exit 1
+fi
+if [[ ! -f "${VELOX_SOURCE}/CMakeLists.txt" ||
+      ! -f "${VELOX_SOURCE}/scripts/setup-centos9.sh" ||
+      ! -d "${VELOX_SOURCE}/CMake" ]]; then
+  echo "Error: --velox-source must point to a Velox source tree: ${VELOX_SOURCE}"
+  exit 1
+fi
+
+echo "Using Presto dependency source: ${PRESTO_SOURCE}"
+echo "Using Velox dependency source: ${VELOX_SOURCE}"
 
 if [[ -n "${UCX_SOURCE}" ]]; then
   UCX_SOURCE="$(cd "${UCX_SOURCE}" && pwd)"
@@ -113,8 +165,13 @@ function compute_ucx_source_hash {
   fi
 }
 
-PRESTO_NATIVE_DIR="${REPO_ROOT}/../presto/presto-native-execution"
+PRESTO_NATIVE_DIR="${PRESTO_SOURCE}/presto-native-execution"
 LOCAL_UCX_CONTEXT=".local_ucx_source"
+if [[ -e "${PRESTO_NATIVE_DIR}/velox.bak" ]]; then
+  echo "Error: stale dependency-build backup already exists: ${PRESTO_NATIVE_DIR}/velox.bak"
+  echo "Inspect and restore or remove it before rebuilding dependencies."
+  exit 1
+fi
 
 # restore original Presto Velox on exit
 function cleanup {
@@ -135,11 +192,11 @@ trap cleanup EXIT
 pushd "${PRESTO_NATIVE_DIR}" > /dev/null
 
 # override Presto Velox build config
-echo "Overriding Presto Velox build config from sibling Velox clone..."
+echo "Overriding Presto Velox build config from selected Velox source..."
 mv velox velox.bak
 mkdir -p velox
-cp -r ../../velox/scripts velox
-cp -r ../../velox/CMake velox
+cp -r "${VELOX_SOURCE}/scripts" velox
+cp -r "${VELOX_SOURCE}/CMake" velox
 
 BUILD_ARGS=()
 if [[ -n "${UCX_SOURCE}" ]]; then
@@ -165,7 +222,7 @@ docker compose --progress plain build ${NO_CACHE_ARG} "${BUILD_ARGS[@]}" centos-
 COMPOSE_IMAGE_NAME='presto/prestissimo-dependency:centos9'
 if [[ "${IMAGE_NAME}" != "${COMPOSE_IMAGE_NAME}" ]]; then
   echo "Tagging image as ${IMAGE_NAME}..."
-  docker tag ${COMPOSE_IMAGE_NAME} ${IMAGE_NAME}
+  docker tag "${COMPOSE_IMAGE_NAME}" "${IMAGE_NAME}"
 fi
 
 # done (will cleanup on exit)

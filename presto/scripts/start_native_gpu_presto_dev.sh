@@ -15,6 +15,7 @@ DEV_JAVA_CLEAN="${PRESTO_DEV_JAVA_CLEAN:-false}"
 DEV_PRESTO_DEPENDENCIES="${PRESTO_DEV_PRESTO_DEPENDENCIES:-false}"
 DEV_UCX_SOURCE="${PRESTO_DEV_UCX_SOURCE:-}"
 DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
+DEV_CUDF_SOURCE="${PRESTO_DEV_CUDF_SOURCE:-}"
 DEV_ARGS=()
 
 print_dev_help() {
@@ -55,6 +56,10 @@ DEV_OPTIONS:
         Build native GPU workers from this Velox source tree instead of the
         default ../velox sibling. The path must be inside the Docker build
         context root. Can also be set with PRESTO_DEV_VELOX_SOURCE.
+    --cudf-source PATH
+        Build native GPU workers from this cuDF source tree instead of the
+        commit fetched by Velox. The path must be inside the Docker build
+        context root. Can also be set with PRESTO_DEV_CUDF_SOURCE.
 
 START_OPTIONS:
     Accepts the same GPU options as start_native_gpu_presto.sh, including:
@@ -100,6 +105,7 @@ Examples:
     $0 -w 2 --wait -b coordinator --restart-target coordinator --skip-ui --dev-presto-dependencies
     $0 -w 2 --wait -b worker --restart-target worker --ucx-source ../../ucx
     $0 -w 2 --wait -b worker --restart-target worker --velox-source ../../velox-gpu-ucx-original
+    $0 -w 2 --wait -b worker --restart-target worker --cudf-source ../../cudf-velox-pin
     $0 -w 2 --wait --restart-target none
 
 EOF
@@ -161,6 +167,10 @@ while [[ $# -gt 0 ]]; do
       DEV_VELOX_SOURCE=${2:?Error: --velox-source requires a value}
       shift 2
       ;;
+    --cudf-source)
+      DEV_CUDF_SOURCE=${2:?Error: --cudf-source requires a value}
+      shift 2
+      ;;
     *)
       DEV_ARGS+=("$1")
       shift
@@ -195,6 +205,14 @@ if [[ -n "$DEV_VELOX_SOURCE" ]]; then
   DEV_VELOX_SOURCE="$(cd "$DEV_VELOX_SOURCE" && pwd)"
   if [[ ! -f "${DEV_VELOX_SOURCE}/CMakeLists.txt" || ! -d "${DEV_VELOX_SOURCE}/velox" ]]; then
     echo "ERROR: --velox-source must point to a Velox source tree." >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "$DEV_CUDF_SOURCE" ]]; then
+  DEV_CUDF_SOURCE="$(cd "$DEV_CUDF_SOURCE" && pwd)"
+  if [[ ! -f "${DEV_CUDF_SOURCE}/cpp/CMakeLists.txt" || ! -d "${DEV_CUDF_SOURCE}/cpp/include/cudf" ]]; then
+    echo "ERROR: --cudf-source must point to a cuDF source tree." >&2
     exit 1
   fi
 fi
@@ -317,6 +335,9 @@ function compute_source_hash() {
   {
     emit_git_hash_input "${REPO_ROOT}/../presto" "presto"
     emit_git_hash_input "$(effective_velox_source)" "velox"
+    if [[ -n "$DEV_CUDF_SOURCE" ]]; then
+      emit_git_hash_input "$DEV_CUDF_SOURCE" "cudf"
+    fi
   } | sha256sum | awk '{print $1}'
 }
 
@@ -324,6 +345,9 @@ function compute_native_build_cache_scope() {
   {
     realpath "${REPO_ROOT}"
     realpath "$(effective_velox_source)"
+    if [[ -n "$DEV_CUDF_SOURCE" ]]; then
+      realpath "$DEV_CUDF_SOURCE"
+    fi
   } | sha256sum | awk '{print substr($1, 1, 16)}'
 }
 
@@ -807,14 +831,34 @@ function render_dev_coordinator_override() {
   echo "$override_path"
 }
 
-function render_dev_velox_source_dockerfile() {
+function source_path_in_build_context() {
+  local source_path=$1
+  local option_name=$2
+  local context_root
+  local relative_source_path
+
+  context_root="$(cd "${REPO_ROOT}/.." && pwd)"
+  relative_source_path="$(realpath --relative-to="$context_root" "$source_path")"
+  if [[ "$relative_source_path" == ".." || "$relative_source_path" == ../* || "$relative_source_path" == /* ]]; then
+    echo "ERROR: ${option_name} must be inside the Docker build context root: ${context_root}" >&2
+    return 1
+  fi
+  if [[ ! "$relative_source_path" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    echo "ERROR: ${option_name} path contains characters that are unsafe in a Docker bind mount: ${source_path}" >&2
+    return 1
+  fi
+
+  echo "$relative_source_path"
+}
+
+function render_dev_native_source_dockerfile() {
   local rendered_dir=$1
-  local velox_source=$2
-  local dockerfile_path="${rendered_dir}/native_build.velox_source.dockerfile"
+  local dockerfile_path="${rendered_dir}/native_build.dev_sources.dockerfile"
   local source_dockerfile="${SCRIPT_DIR}/../docker/native_build.dockerfile"
   local tmp_dockerfile="${dockerfile_path}.tmp"
-  local context_root
-  local relative_velox_source
+  local relative_velox_source="velox"
+  local relative_cudf_source=""
+  local cudf_cmake_override=""
 
   if [[ ! -f "$source_dockerfile" ]]; then
     echo "ERROR: native build Dockerfile not found: ${source_dockerfile}" >&2
@@ -825,22 +869,42 @@ function render_dev_velox_source_dockerfile() {
     exit 1
   fi
 
-  context_root="$(cd "${REPO_ROOT}/.." && pwd)"
-  relative_velox_source="$(realpath --relative-to="$context_root" "$velox_source")"
-  if [[ "$relative_velox_source" == ".." || "$relative_velox_source" == ../* || "$relative_velox_source" == /* ]]; then
-    echo "ERROR: --velox-source must be inside the Docker build context root: ${context_root}" >&2
-    exit 1
+  if [[ -n "$DEV_VELOX_SOURCE" ]]; then
+    relative_velox_source="$(source_path_in_build_context "$DEV_VELOX_SOURCE" "--velox-source")"
   fi
-  if [[ "$relative_velox_source" =~ [[:space:]] ]]; then
-    echo "ERROR: --velox-source path cannot contain whitespace: ${velox_source}" >&2
-    exit 1
+
+  if [[ -n "$DEV_CUDF_SOURCE" ]]; then
+    relative_cudf_source="$(source_path_in_build_context "$DEV_CUDF_SOURCE" "--cudf-source")"
   fi
 
   sed \
     -e "s+source=velox,target=/presto_native_staging/presto/velox+source=${relative_velox_source},target=/presto_native_staging/presto/velox+" \
     "$source_dockerfile" > "$tmp_dockerfile"
+
+  if [[ -n "$relative_cudf_source" ]]; then
+    if ! grep -Fq "export CC=" "$tmp_dockerfile"; then
+      echo "ERROR: native build Dockerfile no longer has the expected compiler export: ${source_dockerfile}" >&2
+      rm -f "$tmp_dockerfile"
+      exit 1
+    fi
+    if ! grep -Fq "source=${relative_velox_source},target=/presto_native_staging/presto/velox" "$tmp_dockerfile"; then
+      echo "ERROR: generated native build Dockerfile has no Velox bind mount." >&2
+      rm -f "$tmp_dockerfile"
+      exit 1
+    fi
+
+    # EXTRA_CMAKE_FLAGS is expanded by the generated Docker build, not here.
+    # shellcheck disable=SC2016
+    cudf_cmake_override='EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DFETCHCONTENT_SOURCE_DIR_CUDF=/presto_native_staging/cudf";'
+    sed \
+      -e "/^export CC=/a\\${cudf_cmake_override}" \
+      -e "\\+source=${relative_velox_source},target=/presto_native_staging/presto/velox+a\\    --mount=type=bind,source=${relative_cudf_source},target=/presto_native_staging/cudf,ro \\\\" \
+      "$tmp_dockerfile" > "${tmp_dockerfile}.cudf"
+    mv "${tmp_dockerfile}.cudf" "$tmp_dockerfile"
+  fi
+
   if [[ ! -s "$tmp_dockerfile" ]]; then
-    echo "ERROR: generated alternate Velox native build Dockerfile is empty." >&2
+    echo "ERROR: generated alternate-source native build Dockerfile is empty." >&2
     rm -f "$tmp_dockerfile"
     exit 1
   fi
@@ -848,16 +912,16 @@ function render_dev_velox_source_dockerfile() {
   echo "$dockerfile_path"
 }
 
-function render_dev_velox_source_override() {
+function render_dev_native_source_override() {
   local rendered_dir=$1
-  local override_path="${rendered_dir}/docker-compose.gpu-dev-velox-source.yml"
+  local override_path="${rendered_dir}/docker-compose.gpu-dev-native-sources.yml"
   local dockerfile_path
   local dockerfile_in_context
   local worker_services=()
   local service
 
   mkdir -p "$rendered_dir"
-  dockerfile_path="$(render_dev_velox_source_dockerfile "$rendered_dir" "$DEV_VELOX_SOURCE")"
+  dockerfile_path="$(render_dev_native_source_dockerfile "$rendered_dir")"
   dockerfile_in_context="velox-testing/presto/docker/docker-compose/generated/$(basename "$dockerfile_path")"
   mapfile -t worker_services < <(gpu_worker_services)
 
@@ -977,10 +1041,15 @@ if build_targets_include "$COORDINATOR_SERVICE"; then
   COORDINATOR_DEV_OVERRIDE_PATH="$(render_dev_coordinator_override "$RENDERED_DIR")"
   COMPOSE_FILE_ARGS+=(-f "$COORDINATOR_DEV_OVERRIDE_PATH")
 fi
-if build_targets_include_gpu_worker && [[ -n "$DEV_VELOX_SOURCE" ]]; then
-  VELOX_SOURCE_OVERRIDE_PATH="$(render_dev_velox_source_override "$RENDERED_DIR")"
-  COMPOSE_FILE_ARGS+=(-f "$VELOX_SOURCE_OVERRIDE_PATH")
-  echo "Using alternate Velox source for native worker build: ${DEV_VELOX_SOURCE}"
+if build_targets_include_gpu_worker && [[ -n "$DEV_VELOX_SOURCE" || -n "$DEV_CUDF_SOURCE" ]]; then
+  NATIVE_SOURCE_OVERRIDE_PATH="$(render_dev_native_source_override "$RENDERED_DIR")"
+  COMPOSE_FILE_ARGS+=(-f "$NATIVE_SOURCE_OVERRIDE_PATH")
+  if [[ -n "$DEV_VELOX_SOURCE" ]]; then
+    echo "Using alternate Velox source for native worker build: ${DEV_VELOX_SOURCE}"
+  fi
+  if [[ -n "$DEV_CUDF_SOURCE" ]]; then
+    echo "Using alternate cuDF source for native worker build: ${DEV_CUDF_SOURCE}"
+  fi
 fi
 if [[ "$DEV_RESTART_TARGET" != "none" || "$WAIT_FOR_WORKERS" == "true" ]]; then
   DEV_NETWORK_OVERRIDE_PATH="$(render_dev_network_override "$RENDERED_DIR")"
