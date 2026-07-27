@@ -13,6 +13,7 @@ DEV_CLEAN_FIRST=false
 DEV_SKIP_UI="${PRESTO_DEV_SKIP_UI:-false}"
 DEV_JAVA_CLEAN="${PRESTO_DEV_JAVA_CLEAN:-false}"
 DEV_PRESTO_DEPENDENCIES="${PRESTO_DEV_PRESTO_DEPENDENCIES:-false}"
+DEV_PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
 DEV_UCX_SOURCE="${PRESTO_DEV_UCX_SOURCE:-}"
 DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 DEV_CUDF_SOURCE="${PRESTO_DEV_CUDF_SOURCE:-}"
@@ -49,6 +50,11 @@ DEV_OPTIONS:
         dev coordinator image and their Maven dependencies. This is the fast
         coordinator iteration path and avoids unrelated tools like
         presto-verifier.
+    --presto-source PATH
+        Build the coordinator and native GPU workers from this Presto source
+        tree instead of the default ../presto sibling. The native source path
+        must be inside the Docker build context root. Can also be set with
+        PRESTO_DEV_PRESTO_SOURCE.
     --ucx-source PATH
         Rebuild the local Presto dependency image from this UCX source tree
         before building GPU workers. Can also be set with PRESTO_DEV_UCX_SOURCE.
@@ -103,6 +109,7 @@ Examples:
     $0 -w 2 --wait -b all --restart-target all
     $0 -w 2 --wait -b coordinator --restart-target coordinator --skip-ui
     $0 -w 2 --wait -b coordinator --restart-target coordinator --skip-ui --dev-presto-dependencies
+    $0 -w 2 --wait -b all --restart-target all --presto-source "${REPO_ROOT}/../presto-output-transport"
     $0 -w 2 --wait -b worker --restart-target worker --ucx-source ../../ucx
     $0 -w 2 --wait -b worker --restart-target worker --velox-source ../../velox-gpu-ucx-original
     $0 -w 2 --wait -b worker --restart-target worker --cudf-source ../../cudf-velox-pin
@@ -159,6 +166,10 @@ while [[ $# -gt 0 ]]; do
       DEV_PRESTO_DEPENDENCIES=true
       shift
       ;;
+    --presto-source)
+      DEV_PRESTO_SOURCE=${2:?Error: --presto-source requires a value}
+      shift 2
+      ;;
     --ucx-source)
       DEV_UCX_SOURCE=${2:?Error: --ucx-source requires a value}
       shift 2
@@ -191,6 +202,21 @@ fi
 if [[ ! ${DEV_RESTART_TARGET} =~ ^(all|coordinator|worker|none)$ ]]; then
   echo "Error: --restart-target must be one of all, coordinator, worker, none." >&2
   exit 1
+fi
+
+if [[ -n "$DEV_PRESTO_SOURCE" ]]; then
+  if [[ ! -d "$DEV_PRESTO_SOURCE" ]]; then
+    echo "ERROR: --presto-source does not exist: ${DEV_PRESTO_SOURCE}" >&2
+    exit 1
+  fi
+  DEV_PRESTO_SOURCE="$(cd "$DEV_PRESTO_SOURCE" && pwd)"
+  if [[ ! -f "${DEV_PRESTO_SOURCE}/pom.xml" ||
+        ! -d "${DEV_PRESTO_SOURCE}/presto-server" ||
+        ! -d "${DEV_PRESTO_SOURCE}/presto-native-execution" ||
+        ! -d "${DEV_PRESTO_SOURCE}/docker" ]]; then
+    echo "ERROR: --presto-source must point to a Presto source tree." >&2
+    exit 1
+  fi
 fi
 
 if [[ -n "$DEV_UCX_SOURCE" ]]; then
@@ -239,8 +265,16 @@ function effective_velox_source() {
   fi
 }
 
+function effective_presto_source() {
+  if [[ -n "$DEV_PRESTO_SOURCE" ]]; then
+    echo "$DEV_PRESTO_SOURCE"
+  else
+    echo "${REPO_ROOT}/../presto"
+  fi
+}
+
 function validate_sibling_repos() {
-  "${REPO_ROOT}/scripts/validate_directories_exist.sh" "${REPO_ROOT}/../presto" "$(effective_velox_source)"
+  "${REPO_ROOT}/scripts/validate_directories_exist.sh" "$(effective_presto_source)" "$(effective_velox_source)"
 }
 
 function validate_sccache_auth() {
@@ -333,7 +367,7 @@ function emit_git_hash_input() {
 
 function compute_source_hash() {
   {
-    emit_git_hash_input "${REPO_ROOT}/../presto" "presto"
+    emit_git_hash_input "$(effective_presto_source)" "presto"
     emit_git_hash_input "$(effective_velox_source)" "velox"
     if [[ -n "$DEV_CUDF_SOURCE" ]]; then
       emit_git_hash_input "$DEV_CUDF_SOURCE" "cudf"
@@ -342,18 +376,39 @@ function compute_source_hash() {
 }
 
 function compute_native_build_cache_scope() {
+  local presto_source
+  local velox_source
+  local toolchain_file
+  presto_source="$(effective_presto_source)"
+  velox_source="$(effective_velox_source)"
+
   {
+    # Keep object caches across ordinary source edits, but rotate them when
+    # the selected native toolchain or dependency-image definition changes.
+    echo "native-build-cache-scope-format=2"
     realpath "${REPO_ROOT}"
-    realpath "$(effective_velox_source)"
+    realpath "$presto_source"
+    realpath "$velox_source"
     if [[ -n "$DEV_CUDF_SOURCE" ]]; then
       realpath "$DEV_CUDF_SOURCE"
     fi
+    for toolchain_file in \
+      "${velox_source}/scripts/setup-centos9.sh" \
+      "${velox_source}/scripts/setup-centos-adapters.sh" \
+      "${presto_source}/presto-native-execution/scripts/dockerfiles/centos-dependency.dockerfile"; do
+      if [[ -f "$toolchain_file" ]]; then
+        sha256sum "$toolchain_file" | awk '{print $1}'
+      else
+        echo "missing:${toolchain_file}"
+      fi
+    done
   } | sha256sum | awk '{print substr($1, 1, 16)}'
 }
 
 function compute_presto_package_hash() {
   local presto_version=$1
-  local docker_dir="${REPO_ROOT}/../presto/docker"
+  local docker_dir
+  docker_dir="$(effective_presto_source)/docker"
   local files=(
     "presto-server-${presto_version}.tar.gz"
     "presto-cli-${presto_version}-executable.jar"
@@ -794,7 +849,8 @@ function render_dev_network_override() {
 function render_dev_coordinator_dockerfile() {
   local rendered_dir=$1
   local dockerfile_path="${rendered_dir}/coordinator_dev.dockerfile"
-  local source_dockerfile="${REPO_ROOT}/../presto/docker/Dockerfile"
+  local source_dockerfile
+  source_dockerfile="$(effective_presto_source)/docker/Dockerfile"
   local runtime_install="dnf install -y java-17-openjdk less procps python3"
   local dev_runtime_install="dnf install -y java-17-openjdk-headless less procps-ng python3 curl-minimal"
 
@@ -817,15 +873,21 @@ function render_dev_coordinator_override() {
   local rendered_dir=$1
   local override_path="${rendered_dir}/docker-compose.gpu-dev-coordinator.yml"
   local dockerfile_path
+  local coordinator_context
+  local coordinator_context_from_rendered
+  local dockerfile_from_context
   mkdir -p "$rendered_dir"
   dockerfile_path="$(render_dev_coordinator_dockerfile "$rendered_dir")"
+  coordinator_context="$(effective_presto_source)/docker"
+  coordinator_context_from_rendered="$(realpath --relative-to="$rendered_dir" "$coordinator_context")"
+  dockerfile_from_context="$(realpath --relative-to="$coordinator_context" "$dockerfile_path")"
 
   {
     printf "services:\n"
     printf "  %s:\n" "$COORDINATOR_SERVICE"
     printf "    build:\n"
-    printf "      context: ../../../../../presto/docker\n"
-    printf "      dockerfile: ../../velox-testing/presto/docker/docker-compose/generated/%s\n" "$(basename "$dockerfile_path")"
+    printf "      context: \"%s\"\n" "$coordinator_context_from_rendered"
+    printf "      dockerfile: \"%s\"\n" "$dockerfile_from_context"
   } > "$override_path"
 
   echo "$override_path"
@@ -856,6 +918,7 @@ function render_dev_native_source_dockerfile() {
   local dockerfile_path="${rendered_dir}/native_build.dev_sources.dockerfile"
   local source_dockerfile="${SCRIPT_DIR}/../docker/native_build.dockerfile"
   local tmp_dockerfile="${dockerfile_path}.tmp"
+  local relative_presto_source
   local relative_velox_source="velox"
   local relative_cudf_source=""
   local cudf_cmake_override=""
@@ -868,6 +931,12 @@ function render_dev_native_source_dockerfile() {
     echo "ERROR: native build Dockerfile no longer has the expected Velox bind mount: ${source_dockerfile}" >&2
     exit 1
   fi
+  if ! grep -Fq "source=presto/presto-native-execution,target=/presto_native_staging/presto" "$source_dockerfile"; then
+    echo "ERROR: native build Dockerfile no longer has the expected Presto bind mount: ${source_dockerfile}" >&2
+    exit 1
+  fi
+
+  relative_presto_source="$(source_path_in_build_context "$(effective_presto_source)" "--presto-source")"
 
   if [[ -n "$DEV_VELOX_SOURCE" ]]; then
     relative_velox_source="$(source_path_in_build_context "$DEV_VELOX_SOURCE" "--velox-source")"
@@ -878,6 +947,7 @@ function render_dev_native_source_dockerfile() {
   fi
 
   sed \
+    -e "s+source=presto/presto-native-execution,target=/presto_native_staging/presto+source=${relative_presto_source}/presto-native-execution,target=/presto_native_staging/presto+" \
     -e "s+source=velox,target=/presto_native_staging/presto/velox+source=${relative_velox_source},target=/presto_native_staging/presto/velox+" \
     "$source_dockerfile" > "$tmp_dockerfile"
 
@@ -1041,9 +1111,12 @@ if build_targets_include "$COORDINATOR_SERVICE"; then
   COORDINATOR_DEV_OVERRIDE_PATH="$(render_dev_coordinator_override "$RENDERED_DIR")"
   COMPOSE_FILE_ARGS+=(-f "$COORDINATOR_DEV_OVERRIDE_PATH")
 fi
-if build_targets_include_gpu_worker && [[ -n "$DEV_VELOX_SOURCE" || -n "$DEV_CUDF_SOURCE" ]]; then
+if build_targets_include_gpu_worker && [[ -n "$DEV_PRESTO_SOURCE" || -n "$DEV_VELOX_SOURCE" || -n "$DEV_CUDF_SOURCE" ]]; then
   NATIVE_SOURCE_OVERRIDE_PATH="$(render_dev_native_source_override "$RENDERED_DIR")"
   COMPOSE_FILE_ARGS+=(-f "$NATIVE_SOURCE_OVERRIDE_PATH")
+  if [[ -n "$DEV_PRESTO_SOURCE" ]]; then
+    echo "Using alternate Presto source for native worker build: ${DEV_PRESTO_SOURCE}"
+  fi
   if [[ -n "$DEV_VELOX_SOURCE" ]]; then
     echo "Using alternate Velox source for native worker build: ${DEV_VELOX_SOURCE}"
   fi
@@ -1076,7 +1149,12 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
   NATIVE_BUILD_CACHE_SCOPE="${NATIVE_BUILD_CACHE_SCOPE:-default}"
 
   if build_targets_include_gpu_worker && [[ -n "$DEV_UCX_SOURCE" ]]; then
-    DEPS_BUILD_ARGS=(--image-name "$DEPS_IMAGE" --ucx-source "$DEV_UCX_SOURCE")
+    DEPS_BUILD_ARGS=(
+      --image-name "$DEPS_IMAGE"
+      --presto-source "$(effective_presto_source)"
+      --velox-source "$(effective_velox_source)"
+      --ucx-source "$DEV_UCX_SOURCE"
+    )
     [[ -n "${SKIP_CACHE_ARG:-}" ]] && DEPS_BUILD_ARGS+=(--no-cache)
     "${SCRIPT_DIR}/build_centos_deps_image.sh" "${DEPS_BUILD_ARGS[@]}"
   fi
@@ -1092,7 +1170,9 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
     [[ "$DEV_SKIP_UI" == true ]] && JAVA_BUILD_ARGS+=(--skip-ui)
     [[ "$DEV_JAVA_CLEAN" == true ]] && JAVA_BUILD_ARGS+=(--clean)
     [[ "$DEV_PRESTO_DEPENDENCIES" == true ]] && JAVA_BUILD_ARGS+=(--dev-presto-dependencies)
-    PRESTO_VERSION=$PRESTO_VERSION "${SCRIPT_DIR}/build_presto_java_package_dev.sh" "${JAVA_BUILD_ARGS[@]}"
+    PRESTO_VERSION=$PRESTO_VERSION \
+      PRESTO_DEV_PRESTO_SOURCE="$(effective_presto_source)" \
+      "${SCRIPT_DIR}/build_presto_java_package_dev.sh" "${JAVA_BUILD_ARGS[@]}"
     PRESTO_DEV_PACKAGE_HASH="$(compute_presto_package_hash "$PRESTO_VERSION")"
     echo "Using PRESTO_DEV_PACKAGE_HASH=${PRESTO_DEV_PACKAGE_HASH}"
   fi
