@@ -143,7 +143,7 @@ RUN \
     --mount=type=cache,target=/root/.cache/sccache/preprocessor \
     --mount=type=cache,target=/root/.cache/sccache-dist-client \
     # Mount sccache auth secrets
-    --mount=type=secret,id=github_token,env=SCCACHE_DIST_AUTH_TOKEN \
+    --mount=type=secret,id=github_token,target=/run/secrets/github_token \
     --mount=type=secret,id=aws_credentials,target=/root/.aws/credentials \
     # Mount sccache setup script
     --mount=type=bind,source=velox-testing/scripts/sccache/sccache_setup.sh,target=/sccache_setup.sh,ro \
@@ -160,6 +160,15 @@ gcc --version | head -1;
 
 # Install and configure sccache if enabled
 if [ "$ENABLE_SCCACHE" = "ON" ]; then
+  # Import the optional file secret without exposing its contents through the
+  # xtrace enabled for the rest of this build step. File-backed BuildKit
+  # secrets work on older Dockerfile frontends that do not support env=.
+  if [ -s /run/secrets/github_token ]; then
+    set +x;
+    SCCACHE_DIST_AUTH_TOKEN="$(cat /run/secrets/github_token)";
+    export SCCACHE_DIST_AUTH_TOKEN;
+    set -x;
+  fi
   if [ -n "${SCCACHE_NO_DIST_COMPILE:-}" ]; then
     export SCCACHE_NO_DIST_COMPILE=1;
   fi

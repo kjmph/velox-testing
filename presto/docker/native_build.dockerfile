@@ -70,7 +70,7 @@ RUN \
     --mount=type=cache,id=presto-native-build-${NATIVE_BUILD_CACHE_SCOPE}-${TARGETARCH}-${BUILD_TYPE}-gpu-${GPU},target=${BUILD_BASE_DIR},sharing=locked \
     --mount=type=cache,target=/root/.cache/sccache/preprocessor \
     --mount=type=cache,target=/root/.cache/sccache-dist-client \
-    --mount=type=secret,id=github_token,env=SCCACHE_DIST_AUTH_TOKEN \
+    --mount=type=secret,id=github_token,target=/run/secrets/github_token \
     --mount=type=secret,id=aws_credentials,target=/root/.aws/credentials \
     --mount=type=bind,source=velox-testing/scripts/sccache/sccache_setup.sh,target=/sccache_setup.sh,ro \
 <<EOF
@@ -113,6 +113,15 @@ if [ -f "${BUILD_BASE_DIR}/CMakeCache.txt" ]; then
 fi
 
 if [ "$ENABLE_SCCACHE" = "ON" ]; then
+  # Secret-to-environment mounts require a newer Dockerfile frontend than is
+  # available on some supported build hosts. Read the conventional secret file
+  # without shell tracing so the token remains compatible and confidential.
+  if [ -s /run/secrets/github_token ]; then
+    set +x;
+    SCCACHE_DIST_AUTH_TOKEN="$(cat /run/secrets/github_token)";
+    export SCCACHE_DIST_AUTH_TOKEN;
+    set -x;
+  fi
   if [ -n "${SCCACHE_NO_DIST_COMPILE:-}" ]; then
     export SCCACHE_NO_DIST_COMPILE=1;
   fi

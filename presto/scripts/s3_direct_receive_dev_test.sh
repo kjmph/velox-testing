@@ -204,6 +204,7 @@ render_s3_direct_receive_compose_override \
 CPU_LAUNCHER="${SCRIPT_DIR}/start_native_cpu_presto_dev.sh"
 GPU_LAUNCHER="${SCRIPT_DIR}/start_native_gpu_presto_dev.sh"
 NATIVE_DOCKERFILE="${SCRIPT_DIR}/../docker/native_build.dockerfile"
+ADAPTERS_DOCKERFILE="${SCRIPT_DIR}/../../velox/docker/adapters_build.dockerfile"
 COMMON_COMPOSE="${SCRIPT_DIR}/../docker/docker-compose.common.yml"
 for launcher in "${CPU_LAUNCHER}" "${GPU_LAUNCHER}"; do
   assert_contains '--s3-direct-receive' "${launcher}"
@@ -233,6 +234,14 @@ assert_contains 'GetDirectResponseReceiveStrictKernelTlsApiVersionV1()' "${NATIV
 assert_contains 'direct_prefix=/opt/presto-s3-direct/lib' "${NATIVE_DOCKERFILE}"
 # shellcheck disable=SC2016
 assert_contains 'Runtime resolved libcurl outside ${direct_prefix}' "${NATIVE_DOCKERFILE}"
+for dockerfile in "${NATIVE_DOCKERFILE}" "${ADAPTERS_DOCKERFILE}"; do
+  assert_contains '--mount=type=secret,id=github_token,target=/run/secrets/github_token' "${dockerfile}"
+  assert_not_contains '--mount=type=secret,id=github_token,env=' "${dockerfile}"
+  assert_contains '    set +x;' "${dockerfile}"
+  # shellcheck disable=SC2016
+  assert_contains 'SCCACHE_DIST_AUTH_TOKEN="$(cat /run/secrets/github_token)"' "${dockerfile}"
+  assert_contains '    set -x;' "${dockerfile}"
+done
 # shellcheck disable=SC2016
 assert_contains 'Runtime resolved ${soname} outside ${direct_prefix}' "${NATIVE_DOCKERFILE}"
 # shellcheck disable=SC2016
