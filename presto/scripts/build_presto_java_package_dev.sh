@@ -264,6 +264,18 @@ fi
 MAVEN_CACHE_DIR="${PRESTO_DEV_MAVEN_CACHE_DIR:-${DEFAULT_MAVEN_CACHE_DIR}}"
 mkdir -p "$MAVEN_CACHE_DIR"
 
+if [[ -f "${MAVEN_CACHE_DIR}/settings.xml" ]]; then
+  MAVEN_SETTINGS_FILE="${MAVEN_CACHE_DIR}/settings.xml"
+else
+  MAVEN_SETTINGS_FILE="${SCRIPT_DIR}/maven-central-mirror-settings.xml"
+fi
+if [[ ! -f "$MAVEN_SETTINGS_FILE" ]]; then
+  echo "ERROR: Maven settings file does not exist: ${MAVEN_SETTINGS_FILE}" >&2
+  exit 1
+fi
+MAVEN_SETTINGS_FILE="$(cd "$(dirname "$MAVEN_SETTINGS_FILE")" && pwd)/$(basename "$MAVEN_SETTINGS_FILE")"
+MAVEN_SETTINGS_CONTAINER_PATH="/tmp/presto-dev-maven-settings.xml"
+
 image_missing() {
   [[ -z "$(docker images -q "$1")" ]]
 }
@@ -284,6 +296,7 @@ DOCKERFILE
 
 echo "Building Presto Java dev package with PRESTO_VERSION: $PRESTO_VERSION"
 echo "Using Presto source: ${DEV_PRESTO_SOURCE}"
+echo "Using Maven settings: ${MAVEN_SETTINGS_FILE}"
 if [[ "$PRESTO_CONTAINER_SOURCE" != "$DEV_PRESTO_SOURCE" ]]; then
   echo "Mapping linked Presto worktree into builder: ${DEV_PRESTO_SOURCE} -> ${PRESTO_CONTAINER_SOURCE}"
 fi
@@ -305,9 +318,12 @@ docker run --rm \
   -v "${DEV_PRESTO_SOURCE}:${PRESTO_CONTAINER_SOURCE}" \
   "${PRESTO_GIT_MOUNT_ARGS[@]}" \
   -v "${MAVEN_CACHE_DIR}:/root/.m2" \
+  -v "${MAVEN_SETTINGS_FILE}:${MAVEN_SETTINGS_CONTAINER_PATH}:ro" \
   -e "GIT_OPTIONAL_LOCKS=0" \
+  -e "MVNW_REPOURL=https://maven-central.storage-download.googleapis.com/maven2" \
   -e "PRESTO_VERSION=${PRESTO_VERSION}" \
   -e "PRESTO_DEV_PRESTO_SOURCE=${PRESTO_CONTAINER_SOURCE}" \
+  -e "PRESTO_DEV_MAVEN_SETTINGS=${MAVEN_SETTINGS_CONTAINER_PATH}" \
   -e "PRESTO_DEV_SKIP_UI=${DEV_SKIP_UI}" \
   -e "PRESTO_DEV_JAVA_CLEAN=${DEV_CLEAN}" \
   -e "PRESTO_DEV_MAVEN_PROJECTS=${DEV_MAVEN_PROJECTS}" \
@@ -321,6 +337,7 @@ docker run --rm \
 
     maven_common_args=(
       --no-transfer-progress
+      --settings "${PRESTO_DEV_MAVEN_SETTINGS}"
       -DskipTests
       -Dair.check.skip-all=true
     )
