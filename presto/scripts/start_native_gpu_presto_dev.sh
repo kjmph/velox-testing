@@ -17,6 +17,7 @@ DEV_PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
 DEV_UCX_SOURCE="${PRESTO_DEV_UCX_SOURCE:-}"
 DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 DEV_CUDF_SOURCE="${PRESTO_DEV_CUDF_SOURCE:-}"
+DEV_S3_DIRECT_RECEIVE="${PRESTO_DEV_S3_DIRECT_RECEIVE:-false}"
 DEV_ARGS=()
 
 print_dev_help() {
@@ -66,6 +67,11 @@ DEV_OPTIONS:
         Build native GPU workers from this cuDF source tree instead of the
         commit fetched by Velox. The path must be inside the Docker build
         context root. Can also be set with PRESTO_DEV_CUDF_SOURCE.
+    --s3-direct-receive
+        Build and run GPU workers with the isolated S3 direct-receive
+        dependency chain and strict KvikIO direct receive. Can also be set
+        with PRESTO_DEV_S3_DIRECT_RECEIVE=true. The ordinary dependency image,
+        worker image, and native object cache remain untouched.
 
 START_OPTIONS:
     Accepts the same GPU options as start_native_gpu_presto.sh, including:
@@ -113,6 +119,7 @@ Examples:
     $0 -w 2 --wait -b worker --restart-target worker --ucx-source ../../ucx
     $0 -w 2 --wait -b worker --restart-target worker --velox-source ../../velox-gpu-ucx-original
     $0 -w 2 --wait -b worker --restart-target worker --cudf-source ../../cudf-velox-pin
+    $0 -w 2 --wait -b worker --restart-target worker --s3-direct-receive
     $0 -w 2 --wait --restart-target none
 
 EOF
@@ -182,6 +189,10 @@ while [[ $# -gt 0 ]]; do
       DEV_CUDF_SOURCE=${2:?Error: --cudf-source requires a value}
       shift 2
       ;;
+    --s3-direct-receive)
+      DEV_S3_DIRECT_RECEIVE=true
+      shift
+      ;;
     *)
       DEV_ARGS+=("$1")
       shift
@@ -196,6 +207,9 @@ if ! DEV_JAVA_CLEAN="$(normalize_dev_bool "$DEV_JAVA_CLEAN" "PRESTO_DEV_JAVA_CLE
   exit 1
 fi
 if ! DEV_PRESTO_DEPENDENCIES="$(normalize_dev_bool "$DEV_PRESTO_DEPENDENCIES" "PRESTO_DEV_PRESTO_DEPENDENCIES")"; then
+  exit 1
+fi
+if ! DEV_S3_DIRECT_RECEIVE="$(normalize_dev_bool "$DEV_S3_DIRECT_RECEIVE" "PRESTO_DEV_S3_DIRECT_RECEIVE")"; then
   exit 1
 fi
 
@@ -257,6 +271,9 @@ set +u
 source "${SCRIPT_DIR}/start_presto_helper_parse_args.sh"
 set -u
 
+# shellcheck source=s3_direct_receive_dev.sh
+source "${SCRIPT_DIR}/s3_direct_receive_dev.sh"
+
 function effective_velox_source() {
   if [[ -n "$DEV_VELOX_SOURCE" ]]; then
     echo "$DEV_VELOX_SOURCE"
@@ -301,8 +318,15 @@ export PRESTO_DEV_NETWORK_NAME
 COORDINATOR_SERVICE="presto-coordinator"
 COORDINATOR_IMAGE="${COORDINATOR_SERVICE}:${PRESTO_IMAGE_TAG}"
 GPU_WORKER_SERVICE="presto-native-worker-gpu"
+ORDINARY_DEPS_IMAGE="${DEPS_IMAGE:-presto/prestissimo-dependency:centos9-${USER:-latest}}"
+DEPS_IMAGE="${ORDINARY_DEPS_IMAGE}"
 GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}"
-DEPS_IMAGE="${DEPS_IMAGE:-presto/prestissimo-dependency:centos9-${USER:-latest}}"
+if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
+  DEPS_IMAGE="${S3_DIRECT_DEPS_IMAGE:-$(derive_s3_direct_dependency_image_name "${ORDINARY_DEPS_IMAGE}")}"
+  GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"
+  export KVIKIO_REMOTE_IO_BACKEND="${KVIKIO_REMOTE_IO_BACKEND:-MULTI_POLL}"
+  export KVIKIO_REMOTE_DIRECT_RECEIVE="${KVIKIO_REMOTE_DIRECT_RECEIVE:-REQUIRE}"
+fi
 GENERIC_DEPS_IMAGE="${GENERIC_DEPS_IMAGE:-presto/prestissimo-dependency:centos9}"
 export DEPS_IMAGE
 
@@ -312,18 +336,18 @@ function is_image_missing() {
   [[ -z "$(docker images -q "$1")" ]]
 }
 
-function ensure_deps_image_available() {
-  if ! is_image_missing "${DEPS_IMAGE}"; then
+function ensure_ordinary_deps_image_available() {
+  if ! is_image_missing "${ORDINARY_DEPS_IMAGE}"; then
     return 0
   fi
 
   if ! is_image_missing "${GENERIC_DEPS_IMAGE}"; then
-    echo "Retagging ${GENERIC_DEPS_IMAGE} as missing user deps image ${DEPS_IMAGE}"
-    docker tag "${GENERIC_DEPS_IMAGE}" "${DEPS_IMAGE}"
+    echo "Retagging ${GENERIC_DEPS_IMAGE} as missing user deps image ${ORDINARY_DEPS_IMAGE}"
+    docker tag "${GENERIC_DEPS_IMAGE}" "${ORDINARY_DEPS_IMAGE}"
     return 0
   fi
 
-  echo "ERROR: Presto dependencies/run-time image '${DEPS_IMAGE}' not found!" >&2
+  echo "ERROR: Presto dependencies/run-time image '${ORDINARY_DEPS_IMAGE}' not found!" >&2
   echo "Also checked fallback image '${GENERIC_DEPS_IMAGE}', but it was not found." >&2
   echo "Build it with presto/scripts/build_centos_deps_image.sh, pass --ucx-source to this script, or fetch it first." >&2
   return 1
@@ -1076,6 +1100,10 @@ fi
 if [[ "${SKIP_GENERATE_CONFIG:-false}" != "true" ]]; then
   VARIANT_TYPE=gpu "${SCRIPT_DIR}/generate_presto_config.sh"
 fi
+apply_s3_direct_receive_worker_catalogs \
+  gpu "${DEV_S3_DIRECT_RECEIVE}" \
+  "${SCRIPT_DIR}/../docker/config/generated/gpu" \
+  "${SCRIPT_DIR}/../docker/config/template/etc_worker/catalog/hive.properties"
 apply_dev_node_addresses
 apply_dev_cudf_tuning
 apply_dev_discovery_tuning
@@ -1107,6 +1135,15 @@ python "$RENDER_SCRIPT_PATH" "${RENDER_ARGS[@]}"
 DOCKER_COMPOSE_FILE_PATH="$RENDERED_PATH"
 
 COMPOSE_FILE_ARGS=(-f "$DOCKER_COMPOSE_FILE_PATH")
+if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
+  mapfile -t S3_DIRECT_WORKER_SERVICES < <(gpu_worker_services)
+  S3_DIRECT_OVERRIDE_PATH="${RENDERED_DIR}/docker-compose.gpu-dev-s3-direct.yml"
+  render_s3_direct_receive_compose_override \
+    gpu true "${GPU_WORKER_IMAGE}" "${S3_DIRECT_OVERRIDE_PATH}" \
+    "${S3_DIRECT_WORKER_SERVICES[@]}"
+  COMPOSE_FILE_ARGS+=(-f "$S3_DIRECT_OVERRIDE_PATH")
+  echo "S3 direct receive enabled for GPU workers (${DEPS_IMAGE})"
+fi
 if build_targets_include "$COORDINATOR_SERVICE"; then
   COORDINATOR_DEV_OVERRIDE_PATH="$(render_dev_coordinator_override "$RENDERED_DIR")"
   COMPOSE_FILE_ARGS+=(-f "$COORDINATOR_DEV_OVERRIDE_PATH")
@@ -1143,6 +1180,9 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
   if build_targets_include_gpu_worker; then
     SOURCE_HASH="$(compute_source_hash)"
     NATIVE_BUILD_CACHE_SCOPE="${NATIVE_BUILD_CACHE_SCOPE:-$(compute_native_build_cache_scope)}"
+    if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
+      NATIVE_BUILD_CACHE_SCOPE="$(isolate_s3_direct_cache_scope "${NATIVE_BUILD_CACHE_SCOPE}")"
+    fi
     echo "Using VELOX_TESTING_SOURCE_HASH=${SOURCE_HASH}"
     echo "Using NATIVE_BUILD_CACHE_SCOPE=${NATIVE_BUILD_CACHE_SCOPE}"
   fi
@@ -1150,7 +1190,7 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
 
   if build_targets_include_gpu_worker && [[ -n "$DEV_UCX_SOURCE" ]]; then
     DEPS_BUILD_ARGS=(
-      --image-name "$DEPS_IMAGE"
+      --image-name "$ORDINARY_DEPS_IMAGE"
       --presto-source "$(effective_presto_source)"
       --velox-source "$(effective_velox_source)"
       --ucx-source "$DEV_UCX_SOURCE"
@@ -1160,7 +1200,21 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
   fi
 
   if build_targets_include_gpu_worker; then
-    ensure_deps_image_available || exit 1
+    ensure_ordinary_deps_image_available || exit 1
+    if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
+      DIRECT_DEPS_NO_CACHE=false
+      [[ -n "${SKIP_CACHE_ARG:-}" ]] && DIRECT_DEPS_NO_CACHE=true
+      # Always run the derived build for a direct worker build. Its immutable
+      # base ID, exact dependency pins, and installer source hash are build
+      # arguments, so BuildKit cheaply reuses a current image and invalidates
+      # a stale one without trusting a mutable tag.
+      ensure_s3_direct_dependency_image \
+        "${DEPS_IMAGE}" \
+        "${ORDINARY_DEPS_IMAGE}" \
+        "$(effective_presto_source)" \
+        "$(effective_velox_source)" \
+        "${DIRECT_DEPS_NO_CACHE}" || exit 1
+    fi
   fi
 
   PRESTO_VERSION=testing
@@ -1208,6 +1262,7 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
     --build-arg "NUM_THREADS=${NUM_THREADS}" \
     --build-arg "BUILD_TYPE=${BUILD_TYPE}" \
     --build-arg "CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}" \
+    --build-arg "S3_DIRECT_RECEIVE=$([[ ${DEV_S3_DIRECT_RECEIVE} == true ]] && echo ON || echo OFF)" \
     "${SCCACHE_BUILD_ARGS[@]}" \
     "${BUILD_TARGET_ARG[@]}"
 fi

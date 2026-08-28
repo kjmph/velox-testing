@@ -37,6 +37,7 @@ services:
       dockerfile: velox-testing/presto/docker/native_build.dockerfile
       args:
         - BASE_IMAGE=${DEPS_IMAGE:-presto/prestissimo-dependency:centos9-${USER}}
+        - S3_DIRECT_RECEIVE=${S3_DIRECT_RECEIVE:-OFF}
     environment:
       - GLOG_logtostderr=1
       - PRESTO_COMPUTE_SANITIZER=${PRESTO_COMPUTE_SANITIZER:-0}

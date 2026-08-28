@@ -4,8 +4,15 @@
 
 set -e
 
-IMAGE_NAME="presto/prestissimo-dependency:centos9-${USER:-latest}"
+DEFAULT_IMAGE_NAME="presto/prestissimo-dependency:centos9-${USER:-latest}"
+COMPOSE_IMAGE_NAME='presto/prestissimo-dependency:centos9'
+IMAGE_NAME="${DEFAULT_IMAGE_NAME}"
+IMAGE_NAME_SET=false
+BASE_IMAGE=''
+BASE_IMAGE_ID=''
+BASE_DEPENDENCY_BUILD_IMAGE=''
 NO_CACHE_ARG=''
+S3_DIRECT_RECEIVE=false
 UCX_SOURCE=''
 UCX_SOURCE_HASH=''
 PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
@@ -25,13 +32,21 @@ build succeeds and is retagged.
 
 OPTIONS:
     -h, --help           Show this help message
-    -i, --image-name     Desired Docker Image name (default: presto/prestissimo-dependency:centos9-\${USER:-latest})
+    -i, --image-name     Desired Docker image name. The normal default is
+                         presto/prestissimo-dependency:centos9-\${USER:-latest}.
+                         Direct-receive mode derives a separate -s3-direct tag
+                         from its base image unless this option is specified.
     -n, --no-cache       Do not use Docker build cache (default: use cache)
     --presto-source PATH Presto source tree whose native dependency image
                          definition should be built (default: ../presto)
     --velox-source PATH  Velox source tree providing dependency setup scripts
                          and CMake modules (default: ../velox)
     --ucx-source PATH    Local UCX source tree to build into the dependency image
+    --s3-direct-receive  Derive an isolated S3 direct-receive dependency image
+                         from an existing CentOS dependency image. This does
+                         not rebuild or retag the base image.
+    --base-image IMAGE   Existing dependency image to extend in direct-receive
+                         mode (default: presto/prestissimo-dependency:centos9-\${USER:-latest})
 
 Environment:
     PRESTO_DEV_PRESTO_SOURCE
@@ -52,6 +67,7 @@ parse_args() {
       -i|--image-name)
         if [[ -n $2 ]]; then
           IMAGE_NAME=$2
+          IMAGE_NAME_SET=true
           shift 2
         else
           echo "Error: --image-name requires a value"
@@ -89,6 +105,19 @@ parse_args() {
           exit 1
         fi
         ;;
+      --s3-direct-receive)
+        S3_DIRECT_RECEIVE=true
+        shift
+        ;;
+      --base-image)
+        if [[ -n $2 ]]; then
+          BASE_IMAGE=$2
+          shift 2
+        else
+          echo "Error: --base-image requires a value"
+          exit 1
+        fi
+        ;;
       *)
         echo "Error: Unknown argument $1"
         print_help
@@ -99,6 +128,67 @@ parse_args() {
 }
 
 parse_args "$@"
+
+function derive_s3_direct_image_name {
+  local base_image=$1
+  local final_component=${base_image##*/}
+
+  if [[ ${base_image} == *@* ]]; then
+    echo "Error: --image-name is required when --base-image uses a digest" >&2
+    return 1
+  fi
+  if [[ ${final_component} == *:* ]]; then
+    printf '%s:%s-s3-direct\n' "${base_image%:*}" "${base_image##*:}"
+  else
+    printf '%s:s3-direct\n' "${base_image}"
+  fi
+}
+
+function normalize_image_reference_for_compare {
+  local image_reference=$1
+  local first_component=${image_reference%%/*}
+  local final_component
+
+  if [[ ${image_reference} == index.docker.io/* ]]; then
+    image_reference="docker.io/${image_reference#index.docker.io/}"
+  elif [[ ${image_reference} != */* ]]; then
+    image_reference="docker.io/library/${image_reference}"
+  elif [[ ${first_component} != *.* &&
+          ${first_component} != *:* &&
+          ${first_component} != localhost ]]; then
+    image_reference="docker.io/${image_reference}"
+  fi
+  final_component=${image_reference##*/}
+  if [[ ${image_reference} != *@* && ${final_component} != *:* ]]; then
+    image_reference="${image_reference}:latest"
+  fi
+  printf '%s\n' "${image_reference}"
+}
+
+if ${S3_DIRECT_RECEIVE}; then
+  BASE_IMAGE=${BASE_IMAGE:-${DEFAULT_IMAGE_NAME}}
+  if ! ${IMAGE_NAME_SET}; then
+    IMAGE_NAME=$(derive_s3_direct_image_name "${BASE_IMAGE}")
+  fi
+  NORMALIZED_IMAGE_NAME=$(normalize_image_reference_for_compare "${IMAGE_NAME}")
+  NORMALIZED_BASE_IMAGE=$(normalize_image_reference_for_compare "${BASE_IMAGE}")
+  NORMALIZED_COMPOSE_IMAGE_NAME=$(normalize_image_reference_for_compare "${COMPOSE_IMAGE_NAME}")
+  NORMALIZED_DEFAULT_IMAGE_NAME=$(normalize_image_reference_for_compare "${DEFAULT_IMAGE_NAME}")
+  if [[ ${NORMALIZED_IMAGE_NAME} == "${NORMALIZED_BASE_IMAGE}" ||
+        ${NORMALIZED_IMAGE_NAME} == "${NORMALIZED_COMPOSE_IMAGE_NAME}" ||
+        ${NORMALIZED_IMAGE_NAME} == "${NORMALIZED_DEFAULT_IMAGE_NAME}" ]]; then
+    echo "Error: the direct-receive image must not replace its base or an ordinary dependency image"
+    exit 1
+  fi
+  if [[ -n ${UCX_SOURCE} ]]; then
+    echo "Error: --ucx-source cannot be combined with --s3-direct-receive"
+    echo "Build the base dependency image with --ucx-source first, then extend that image."
+    exit 1
+  fi
+elif [[ -n ${BASE_IMAGE} ]]; then
+  echo "Error: --base-image requires --s3-direct-receive"
+  exit 1
+fi
 
 # Compute the directory where this script resides
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -130,9 +220,83 @@ if [[ ! -f "${VELOX_SOURCE}/CMakeLists.txt" ||
   echo "Error: --velox-source must point to a Velox source tree: ${VELOX_SOURCE}"
   exit 1
 fi
+if ${S3_DIRECT_RECEIVE} &&
+  [[ ! -f "${VELOX_SOURCE}/scripts/setup-common.sh" ||
+    ! -f "${VELOX_SOURCE}/scripts/setup-versions.sh" ]]; then
+  echo "Error: selected Velox source does not provide the S3 direct-receive installer"
+  exit 1
+fi
 
 echo "Using Presto dependency source: ${PRESTO_SOURCE}"
 echo "Using Velox dependency source: ${VELOX_SOURCE}"
+
+function read_literal_commit_assignment {
+  local assignment_name=$1
+  local versions_file=$2
+
+  awk -v assignment_name="${assignment_name}" '
+    index($0, assignment_name "=\"") == 1 && substr($0, length($0), 1) == "\"" {
+      value = substr($0, length(assignment_name) + 3)
+      value = substr(value, 1, length(value) - 1)
+      if (value !~ /^[0-9a-f]+$/ || length(value) != 40) {
+        exit 1
+      }
+      print value
+      ++matches
+      next
+    }
+    $0 ~ ("^" assignment_name "=") {
+      exit 1
+    }
+    END {
+      if (matches != 1) {
+        exit 1
+      }
+    }
+  ' "${versions_file}"
+}
+
+function compute_installer_source_hash {
+  (
+    cd "${VELOX_SOURCE}"
+    find scripts \( -type f -o -type l \) -print0 |
+      LC_ALL=C sort -z |
+      xargs -0 sha256sum |
+      sha256sum |
+      awk '{print $1}'
+  )
+}
+
+S3_DIRECT_RECEIVE_CURL_COMMIT=''
+S3_DIRECT_RECEIVE_AWS_SDK_COMMIT=''
+S3_DIRECT_RECEIVE_INSTALLER_SOURCE_SHA256=''
+if ${S3_DIRECT_RECEIVE}; then
+  if ! S3_DIRECT_RECEIVE_CURL_COMMIT=$(read_literal_commit_assignment \
+    S3_DIRECT_RECEIVE_CURL_COMMIT \
+    "${VELOX_SOURCE}/scripts/setup-versions.sh") ||
+    ! S3_DIRECT_RECEIVE_AWS_SDK_COMMIT=$(read_literal_commit_assignment \
+      S3_DIRECT_RECEIVE_AWS_SDK_COMMIT \
+      "${VELOX_SOURCE}/scripts/setup-versions.sh"); then
+    echo "Error: selected Velox source must pin exact 40-character curl and AWS SDK commits"
+    exit 1
+  fi
+  S3_DIRECT_RECEIVE_INSTALLER_SOURCE_SHA256=$(compute_installer_source_hash)
+  if ! BASE_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "${BASE_IMAGE}" 2>/dev/null); then
+    echo "Error: S3 direct-receive base image does not exist locally: ${BASE_IMAGE}"
+    echo "Build or fetch that dependency image before deriving the direct-receive image."
+    exit 1
+  fi
+  if [[ ! ${BASE_IMAGE_ID} =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "Error: unable to determine an immutable image ID for ${BASE_IMAGE}"
+    exit 1
+  fi
+  echo "Using S3 direct-receive base image: ${BASE_IMAGE}"
+  echo "Using S3 direct-receive base image ID: ${BASE_IMAGE_ID}"
+  echo "Writing S3 direct-receive image: ${IMAGE_NAME}"
+  echo "Pinned direct-receive curl: ${S3_DIRECT_RECEIVE_CURL_COMMIT}"
+  echo "Pinned direct-receive AWS SDK: ${S3_DIRECT_RECEIVE_AWS_SDK_COMMIT}"
+  echo "Selected Velox installer source SHA256: ${S3_DIRECT_RECEIVE_INSTALLER_SOURCE_SHA256}"
+fi
 
 if [[ -n "${UCX_SOURCE}" ]]; then
   UCX_SOURCE="$(cd "${UCX_SOURCE}" && pwd)"
@@ -175,18 +339,53 @@ fi
 
 # restore original Presto Velox on exit
 function cleanup {
-  pushd "${PRESTO_NATIVE_DIR}" > /dev/null || return
-  if [[ -d velox.bak ]]; then
-    echo "Restoring original Presto Velox..."
-    rm -rf velox
-    mv velox.bak velox
+  local exit_status=$?
+  local cleanup_status=0
+  trap - EXIT
+  set +e
+  if pushd "${PRESTO_NATIVE_DIR}" > /dev/null; then
+    if [[ -d velox.bak ]]; then
+      echo "Restoring original Presto Velox..."
+      rm -rf velox && mv velox.bak velox || cleanup_status=1
+    fi
+    if [[ -n "${UCX_SOURCE}" ]]; then
+      rm -rf "${LOCAL_UCX_CONTEXT}" || cleanup_status=1
+    fi
+    popd > /dev/null || cleanup_status=1
+  else
+    cleanup_status=1
   fi
-  if [[ -n "${UCX_SOURCE}" ]]; then
-    rm -rf "${LOCAL_UCX_CONTEXT}"
+  if [[ ${exit_status} -ne 0 ]]; then
+    exit "${exit_status}"
   fi
-  popd > /dev/null || return
+  exit "${cleanup_status}"
 }
 trap cleanup EXIT
+
+if ${S3_DIRECT_RECEIVE}; then
+  # BuildKit does not reliably accept a bare local sha256 image ID in FROM.
+  # Give the inspected ID a stable content-addressed local alias. This pins
+  # both stages if the caller's mutable base tag changes during the build and
+  # preserves the FROM identity across launches so BuildKit can reuse layers.
+  BASE_DEPENDENCY_BUILD_IMAGE="presto/s3-direct-build-base:sha256-${BASE_IMAGE_ID#sha256:}"
+  CONTENT_ADDRESSED_BASE_ID=''
+  if CONTENT_ADDRESSED_BASE_ID=$(docker image inspect \
+    --format '{{.Id}}' "${BASE_DEPENDENCY_BUILD_IMAGE}" 2>/dev/null); then
+    if [[ ${CONTENT_ADDRESSED_BASE_ID} != "${BASE_IMAGE_ID}" ]]; then
+      echo "Error: content-addressed base alias resolves to an unexpected image: ${BASE_DEPENDENCY_BUILD_IMAGE}"
+      echo "Expected ${BASE_IMAGE_ID}, found ${CONTENT_ADDRESSED_BASE_ID}; refusing to overwrite it."
+      exit 1
+    fi
+  else
+    docker tag "${BASE_IMAGE_ID}" "${BASE_DEPENDENCY_BUILD_IMAGE}"
+    CONTENT_ADDRESSED_BASE_ID=$(docker image inspect \
+      --format '{{.Id}}' "${BASE_DEPENDENCY_BUILD_IMAGE}" 2>/dev/null || true)
+    if [[ ${CONTENT_ADDRESSED_BASE_ID} != "${BASE_IMAGE_ID}" ]]; then
+      echo "Error: failed to create the content-addressed base alias: ${BASE_DEPENDENCY_BUILD_IMAGE}"
+      exit 1
+    fi
+  fi
+fi
 
 # move to Presto Velox
 pushd "${PRESTO_NATIVE_DIR}" > /dev/null
@@ -216,13 +415,36 @@ fi
 
 # now build
 echo "Building..."
-docker compose --progress plain build ${NO_CACHE_ARG} "${BUILD_ARGS[@]}" centos-native-dependency
+if ${S3_DIRECT_RECEIVE}; then
+  S3_DIRECT_DOCKERFILE="${REPO_ROOT}/presto/docker/s3_direct_receive_deps.dockerfile"
+  if [[ ! -f ${S3_DIRECT_DOCKERFILE} ]]; then
+    echo "Error: S3 direct-receive Dockerfile not found: ${S3_DIRECT_DOCKERFILE}"
+    exit 1
+  fi
+  DIRECT_BUILD_ARGS=(
+    --build-arg "BASE_DEPENDENCY_BUILD_IMAGE=${BASE_DEPENDENCY_BUILD_IMAGE}"
+    --build-arg "BASE_DEPENDENCY_IMAGE=${BASE_IMAGE}"
+    --build-arg "BASE_DEPENDENCY_IMAGE_ID=${BASE_IMAGE_ID}"
+    --build-arg "EXPECTED_CURL_COMMIT=${S3_DIRECT_RECEIVE_CURL_COMMIT}"
+    --build-arg "EXPECTED_AWS_SDK_COMMIT=${S3_DIRECT_RECEIVE_AWS_SDK_COMMIT}"
+    --build-arg "INSTALLER_SOURCE_SHA256=${S3_DIRECT_RECEIVE_INSTALLER_SOURCE_SHA256}"
+  )
+  if [[ -n ${NO_CACHE_ARG} ]]; then
+    DIRECT_BUILD_ARGS+=("${NO_CACHE_ARG}")
+  fi
+  docker build --progress plain \
+    "${DIRECT_BUILD_ARGS[@]}" \
+    --file "${S3_DIRECT_DOCKERFILE}" \
+    --tag "${IMAGE_NAME}" \
+    "${PRESTO_NATIVE_DIR}"
+else
+  docker compose --progress plain build ${NO_CACHE_ARG} "${BUILD_ARGS[@]}" centos-native-dependency
 
-# tag with the user-specific name to avoid conflicts between multiple users on the same host
-COMPOSE_IMAGE_NAME='presto/prestissimo-dependency:centos9'
-if [[ "${IMAGE_NAME}" != "${COMPOSE_IMAGE_NAME}" ]]; then
-  echo "Tagging image as ${IMAGE_NAME}..."
-  docker tag "${COMPOSE_IMAGE_NAME}" "${IMAGE_NAME}"
+  # tag with the user-specific name to avoid conflicts between multiple users on the same host
+  if [[ "${IMAGE_NAME}" != "${COMPOSE_IMAGE_NAME}" ]]; then
+    echo "Tagging image as ${IMAGE_NAME}..."
+    docker tag "${COMPOSE_IMAGE_NAME}" "${IMAGE_NAME}"
+  fi
 fi
 
 # done (will cleanup on exit)

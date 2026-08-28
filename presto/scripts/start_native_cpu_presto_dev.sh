@@ -15,6 +15,7 @@ DEV_JAVA_CLEAN="${PRESTO_DEV_JAVA_CLEAN:-false}"
 DEV_PRESTO_DEPENDENCIES="${PRESTO_DEV_PRESTO_DEPENDENCIES:-false}"
 DEV_PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
 DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
+DEV_S3_DIRECT_RECEIVE="${PRESTO_DEV_S3_DIRECT_RECEIVE:-false}"
 DEV_ARGS=()
 
 print_dev_help() {
@@ -57,6 +58,11 @@ DEV_OPTIONS:
         Build native CPU workers from this Velox source tree instead of the
         default ../velox sibling. The path must be inside the Docker build
         context root. Can also be set with PRESTO_DEV_VELOX_SOURCE.
+    --s3-direct-receive
+        Build and run CPU workers with the isolated S3 direct-receive
+        dependency chain. Can also be set with
+        PRESTO_DEV_S3_DIRECT_RECEIVE=true. The ordinary dependency image,
+        worker image, and native object cache remain untouched.
 
 START_OPTIONS:
     Accepts the same CPU options as start_native_cpu_presto.sh, including:
@@ -88,6 +94,7 @@ Examples:
     $0 -w 2 --wait -b coordinator --restart-target coordinator --skip-ui --dev-presto-dependencies
     $0 -w 2 --wait -b all --restart-target all --presto-source "${REPO_ROOT}/../presto-output-transport"
     $0 -w 2 --wait -b worker --restart-target worker --velox-source "${REPO_ROOT}/../velox-ucx"
+    $0 -w 2 --wait -b worker --restart-target worker --s3-direct-receive
     $0 -w 2 --wait --restart-target none
     $0 -w 2 -b worker --restart-target none
 
@@ -150,6 +157,10 @@ while [[ $# -gt 0 ]]; do
       DEV_VELOX_SOURCE=${2:?Error: --velox-source requires a value}
       shift 2
       ;;
+    --s3-direct-receive)
+      DEV_S3_DIRECT_RECEIVE=true
+      shift
+      ;;
     *)
       DEV_ARGS+=("$1")
       shift
@@ -164,6 +175,9 @@ if ! DEV_JAVA_CLEAN="$(normalize_dev_bool "$DEV_JAVA_CLEAN" "PRESTO_DEV_JAVA_CLE
   exit 1
 fi
 if ! DEV_PRESTO_DEPENDENCIES="$(normalize_dev_bool "$DEV_PRESTO_DEPENDENCIES" "PRESTO_DEV_PRESTO_DEPENDENCIES")"; then
+  exit 1
+fi
+if ! DEV_S3_DIRECT_RECEIVE="$(normalize_dev_bool "$DEV_S3_DIRECT_RECEIVE" "PRESTO_DEV_S3_DIRECT_RECEIVE")"; then
   exit 1
 fi
 
@@ -209,6 +223,9 @@ set +u
 source "${SCRIPT_DIR}/start_presto_helper_parse_args.sh"
 set -u
 
+# shellcheck source=s3_direct_receive_dev.sh
+source "${SCRIPT_DIR}/s3_direct_receive_dev.sh"
+
 function effective_velox_source() {
   if [[ -n "$DEV_VELOX_SOURCE" ]]; then
     echo "$DEV_VELOX_SOURCE"
@@ -253,8 +270,13 @@ export PRESTO_DEV_NETWORK_NAME
 COORDINATOR_SERVICE="presto-coordinator"
 COORDINATOR_IMAGE="${COORDINATOR_SERVICE}:${PRESTO_IMAGE_TAG}"
 CPU_WORKER_SERVICE="presto-native-worker-cpu"
+ORDINARY_DEPS_IMAGE="${DEPS_IMAGE:-presto/prestissimo-dependency:centos9-${USER:-latest}}"
+DEPS_IMAGE="${ORDINARY_DEPS_IMAGE}"
 CPU_WORKER_IMAGE="${CPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}"
-DEPS_IMAGE="presto/prestissimo-dependency:centos9-${USER:-latest}"
+if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
+  DEPS_IMAGE="${S3_DIRECT_DEPS_IMAGE:-$(derive_s3_direct_dependency_image_name "${ORDINARY_DEPS_IMAGE}")}"
+  CPU_WORKER_IMAGE="${CPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"
+fi
 export DEPS_IMAGE
 
 BUILD_TARGET_ARG=()
@@ -810,6 +832,10 @@ fi
 if [[ "${SKIP_GENERATE_CONFIG:-false}" != "true" ]]; then
   VARIANT_TYPE=cpu "${SCRIPT_DIR}/generate_presto_config.sh"
 fi
+apply_s3_direct_receive_worker_catalogs \
+  cpu "${DEV_S3_DIRECT_RECEIVE}" \
+  "${SCRIPT_DIR}/../docker/config/generated/cpu" \
+  "${SCRIPT_DIR}/../docker/config/template/etc_worker/catalog/hive.properties"
 apply_dev_node_addresses
 apply_dev_discovery_tuning
 
@@ -834,6 +860,15 @@ fi
 
 RENDERED_DIR="${SCRIPT_DIR}/../docker/docker-compose/generated"
 COMPOSE_FILE_ARGS=(-f "$DOCKER_COMPOSE_FILE_PATH")
+if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
+  mapfile -t S3_DIRECT_WORKER_SERVICES < <(cpu_worker_services)
+  S3_DIRECT_OVERRIDE_PATH="${RENDERED_DIR}/docker-compose.cpu-dev-s3-direct.yml"
+  render_s3_direct_receive_compose_override \
+    cpu true "${CPU_WORKER_IMAGE}" "${S3_DIRECT_OVERRIDE_PATH}" \
+    "${S3_DIRECT_WORKER_SERVICES[@]}"
+  COMPOSE_FILE_ARGS+=(-f "$S3_DIRECT_OVERRIDE_PATH")
+  echo "S3 direct receive enabled for CPU workers (${DEPS_IMAGE})"
+fi
 if [[ "$ENABLE_SCCACHE" == true ]] && build_targets_include_cpu_worker; then
   SCCACHE_OVERRIDE_PATH="$(render_dev_sccache_override "$RENDERED_DIR")"
   COMPOSE_FILE_ARGS+=(-f "$SCCACHE_OVERRIDE_PATH")
@@ -871,15 +906,29 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
   if build_targets_include_cpu_worker; then
     SOURCE_HASH="$(compute_source_hash)"
     NATIVE_BUILD_CACHE_SCOPE="${NATIVE_BUILD_CACHE_SCOPE:-$(compute_native_build_cache_scope)}"
+    if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
+      NATIVE_BUILD_CACHE_SCOPE="$(isolate_s3_direct_cache_scope "${NATIVE_BUILD_CACHE_SCOPE}")"
+    fi
     echo "Using VELOX_TESTING_SOURCE_HASH=${SOURCE_HASH}"
     echo "Using NATIVE_BUILD_CACHE_SCOPE=${NATIVE_BUILD_CACHE_SCOPE}"
   fi
   NATIVE_BUILD_CACHE_SCOPE="${NATIVE_BUILD_CACHE_SCOPE:-default}"
 
-  if [[ ${BUILD_TARGET_ARG[*]} =~ $CPU_WORKER_SERVICE ]] && is_image_missing "${DEPS_IMAGE}"; then
-    echo "ERROR: Presto dependencies/run-time image '${DEPS_IMAGE}' not found!" >&2
-    echo "Build it with presto/scripts/build_centos_deps_image.sh or fetch it first." >&2
-    exit 1
+  if build_targets_include_cpu_worker; then
+    if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
+      DIRECT_DEPS_NO_CACHE=false
+      [[ -n "${SKIP_CACHE_ARG:-}" ]] && DIRECT_DEPS_NO_CACHE=true
+      ensure_s3_direct_dependency_image \
+        "${DEPS_IMAGE}" \
+        "${ORDINARY_DEPS_IMAGE}" \
+        "$(effective_presto_source)" \
+        "$(effective_velox_source)" \
+        "${DIRECT_DEPS_NO_CACHE}" || exit 1
+    elif is_image_missing "${DEPS_IMAGE}"; then
+      echo "ERROR: Presto dependencies/run-time image '${DEPS_IMAGE}' not found!" >&2
+      echo "Build it with presto/scripts/build_centos_deps_image.sh or fetch it first." >&2
+      exit 1
+    fi
   fi
 
   PRESTO_VERSION=testing
@@ -920,6 +969,7 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
     --build-arg "NUM_THREADS=${NUM_THREADS}" \
     --build-arg "BUILD_TYPE=${BUILD_TYPE}" \
     --build-arg "CUDA_ARCHITECTURES=" \
+    --build-arg "S3_DIRECT_RECEIVE=$([[ ${DEV_S3_DIRECT_RECEIVE} == true ]] && echo ON || echo OFF)" \
     "${SCCACHE_BUILD_ARGS[@]}" \
     "${BUILD_TARGET_ARG[@]}"
 fi
