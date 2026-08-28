@@ -932,6 +932,7 @@ function container_ip_on_project_network() {
 
 function verify_cpu_worker_endpoints() {
   local quiet="${1:-false}"
+  local config_dir="${SCRIPT_DIR}/../docker/config/generated/cpu"
   local worker_services=()
   mapfile -t worker_services < <(cpu_worker_services)
 
@@ -939,13 +940,31 @@ function verify_cpu_worker_endpoints() {
   local i
   for i in "${!worker_services[@]}"; do
     local service="${worker_services[$i]}"
+    local worker_config
+    if [[ "${#worker_services[@]}" -eq 1 ]]; then
+      worker_config="${config_dir}/etc_worker/config_native.properties"
+    else
+      worker_config="${config_dir}/etc_worker_${i}/config_native.properties"
+    fi
+    if [[ ! -f "$worker_config" ]]; then
+      echo "ERROR: expected worker config does not exist: ${worker_config}." >&2
+      return 1
+    fi
+
+    local port
+    port="$(sed -n 's/^http-server\.http\.port=\([0-9][0-9]*\)$/\1/p' "$worker_config" | tail -n 1)"
+    if [[ -z "$port" ]]; then
+      echo "ERROR: unable to read http-server.http.port from ${worker_config}." >&2
+      return 1
+    fi
+
     local ip
     ip="$(container_ip_on_project_network "$service")"
     if [[ -z "$ip" ]]; then
       echo "ERROR: unable to inspect Docker IP for ${service} on ${PRESTO_DEV_NETWORK_NAME}." >&2
       return 1
     fi
-    expected_lines+=("${service} ${ip} $((10000 + (10 * i)))")
+    expected_lines+=("${service} ${ip} ${port}")
   done
 
   EXPECTED_WORKER_ENDPOINTS="$(printf "%s\n" "${expected_lines[@]}")" VERIFY_WORKER_ENDPOINTS_QUIET="$quiet" python3 - <<'PY'
