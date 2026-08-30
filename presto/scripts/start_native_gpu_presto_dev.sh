@@ -82,8 +82,10 @@ DEV_OPTIONS:
         Select the GPU reader while retaining the isolated direct-receive
         dependency chain. "kvikio" receives through KvikIO without the Velox
         host cache. "buffered" receives through Velox/AWS SDK caller buffers
-        without caching. "buffered-cache" adds Velox AsyncDataCache. Supplying
-        this option implies --s3-direct-receive. Can also be set with
+        without caching. "buffered-cache" adds Velox AsyncDataCache and stable
+        soft-affinity placement. Entering or leaving buffered-cache may widen a
+        worker-only restart to include the coordinator. Supplying this option
+        implies --s3-direct-receive. Can also be set with
         PRESTO_DEV_GPU_S3_READER_MODE when direct receive is enabled.
         GPU_HOST_RESERVE_GB, GPU_SYSTEM_MEM_LIMIT_GB, GPU_SYSTEM_MEM_GB, and
         GPU_QUERY_MEM_GB override the safe per-worker host-memory calculation.
@@ -544,6 +546,31 @@ function ensure_dev_network() {
 
 function coordinator_container_running() {
   [[ "$(docker inspect -f '{{.State.Running}}' "$COORDINATOR_SERVICE" 2>/dev/null || true)" == "true" ]]
+}
+
+function reconcile_gpu_s3_coordinator_restart_target() {
+  [[ ${DEV_RESTART_TARGET} == worker ]] || return 0
+  coordinator_container_running || return 0
+
+  local baseline_coordinator_catalog="${SCRIPT_DIR}/../docker/config/template/etc_coordinator/catalog/hive.properties"
+  local active_state='UNKNOWN'
+  local reconciled_target
+  active_state=$(docker inspect --format \
+    "{{ index .Config.Labels \"${GPU_S3_NODE_SELECTION_STATE_LABEL}\" }}" \
+    "${COORDINATOR_SERVICE}" 2>/dev/null) || active_state='UNKNOWN'
+  reconciled_target=$(
+    gpu_s3_restart_target_for_coordinator_state \
+      "${DEV_RESTART_TARGET}" \
+      "${DEV_S3_DIRECT_RECEIVE}" \
+      "${DEV_GPU_S3_READER_MODE}" \
+      "${baseline_coordinator_catalog}" \
+      "${active_state}"
+  )
+
+  if [[ ${reconciled_target} != "${DEV_RESTART_TARGET}" ]]; then
+    echo "GPU S3 reader mode changes the coordinator node-selection policy; widening --restart-target worker to all."
+    DEV_RESTART_TARGET=${reconciled_target}
+  fi
 }
 
 function ensure_coordinator_network_compatible() {
@@ -1120,6 +1147,8 @@ function compute_cuda_architectures() {
     awk 'NR == 1 { gsub(/\./, ""); architecture = $0 } END { print architecture }'
 }
 
+reconcile_gpu_s3_coordinator_restart_target
+
 conditionally_add_build_target "$COORDINATOR_IMAGE" "$COORDINATOR_SERVICE" "coordinator|c"
 
 DOCKER_COMPOSE_FILE="native-gpu"
@@ -1156,6 +1185,11 @@ fi
 if [[ "${SKIP_GENERATE_CONFIG:-false}" != "true" ]]; then
   VARIANT_TYPE=gpu "${SCRIPT_DIR}/generate_presto_config.sh"
 fi
+apply_gpu_s3_coordinator_config \
+  "${DEV_S3_DIRECT_RECEIVE}" \
+  "${DEV_GPU_S3_READER_MODE}" \
+  "${SCRIPT_DIR}/../docker/config/generated/gpu" \
+  "${SCRIPT_DIR}/../docker/config/template/etc_coordinator/catalog/hive.properties"
 apply_s3_direct_receive_worker_catalogs \
   gpu "${DEV_S3_DIRECT_RECEIVE}" \
   "${SCRIPT_DIR}/../docker/config/generated/gpu" \
@@ -1198,6 +1232,13 @@ python "$RENDER_SCRIPT_PATH" "${RENDER_ARGS[@]}"
 DOCKER_COMPOSE_FILE_PATH="$RENDERED_PATH"
 
 COMPOSE_FILE_ARGS=(-f "$DOCKER_COMPOSE_FILE_PATH")
+GPU_S3_COORDINATOR_STATE_OVERRIDE_PATH="${RENDERED_DIR}/docker-compose.gpu-dev-s3-reader-state.yml"
+render_gpu_s3_coordinator_state_override \
+  "${DEV_S3_DIRECT_RECEIVE}" \
+  "${DEV_GPU_S3_READER_MODE}" \
+  "${SCRIPT_DIR}/../docker/config/template/etc_coordinator/catalog/hive.properties" \
+  "${GPU_S3_COORDINATOR_STATE_OVERRIDE_PATH}"
+COMPOSE_FILE_ARGS+=(-f "${GPU_S3_COORDINATOR_STATE_OVERRIDE_PATH}")
 if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
   mapfile -t S3_DIRECT_WORKER_SERVICES < <(gpu_worker_services)
   S3_DIRECT_OVERRIDE_PATH="${RENDERED_DIR}/docker-compose.gpu-dev-s3-direct.yml"

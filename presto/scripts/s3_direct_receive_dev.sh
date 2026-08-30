@@ -30,6 +30,8 @@ S3_DIRECT_RECEIVE_KVIKIO_ENV=(
   KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE
   KVIKIO_REMOTE_DIRECT_RECEIVE_MAX_PINNED_BYTES
 )
+GPU_S3_NODE_SELECTION_STATE_LABEL='com.nvidia.velox-testing.gpu-s3-node-selection-strategy'
+GPU_S3_NODE_SELECTION_STATE_UNSET='UNSET'
 
 function apply_s3_direct_receive_kvikio_defaults() {
   # These defaults are specific to the GPU S3 direct-receive path. Keep every
@@ -185,6 +187,126 @@ function set_properties_file_value_exact() {
 
   remove_properties_file_key_if_present "${key}" "${file}"
   printf '\n%s=%s\n' "${key}" "${value}" >> "${file}"
+}
+
+function properties_file_value() {
+  local key=$1
+  local file=$2
+  local key_regex=${key//./\\.}
+
+  [[ -f ${file} ]] || return 0
+  sed -n "s/^${key_regex}=//p" "${file}" | tail -n 1
+}
+
+function gpu_s3_node_selection_strategy() {
+  local enabled=$1
+  local reader_mode=$2
+  local baseline_coordinator_catalog=$3
+
+  if [[ ${enabled} == true ]]; then
+    reader_mode=$(normalize_gpu_s3_reader_mode "${reader_mode}") || return 1
+  fi
+
+  if [[ ${enabled} == true && ${reader_mode} == buffered-cache ]]; then
+    printf '%s\n' SOFT_AFFINITY
+    return 0
+  fi
+
+  properties_file_value \
+    "hive.node-selection-strategy" "${baseline_coordinator_catalog}"
+}
+
+function gpu_s3_node_selection_state() {
+  local enabled=$1
+  local reader_mode=$2
+  local baseline_coordinator_catalog=$3
+  local strategy
+
+  strategy=$(
+    gpu_s3_node_selection_strategy \
+      "${enabled}" "${reader_mode}" "${baseline_coordinator_catalog}"
+  ) || return 1
+  printf '%s\n' "${strategy:-${GPU_S3_NODE_SELECTION_STATE_UNSET}}"
+}
+
+function gpu_s3_coordinator_requires_restart() {
+  local enabled=$1
+  local reader_mode=$2
+  local baseline_coordinator_catalog=$3
+  local active_state=$4
+  local desired_state
+
+  desired_state=$(
+    gpu_s3_node_selection_state \
+      "${enabled}" "${reader_mode}" "${baseline_coordinator_catalog}"
+  ) || return 1
+
+  [[ ${active_state} != "${desired_state}" ]]
+}
+
+function gpu_s3_restart_target_for_coordinator_state() {
+  local requested_target=$1
+  local enabled=$2
+  local reader_mode=$3
+  local baseline_coordinator_catalog=$4
+  local active_state=$5
+  local desired_state
+
+  desired_state=$(
+    gpu_s3_node_selection_state \
+      "${enabled}" "${reader_mode}" "${baseline_coordinator_catalog}"
+  ) || return 1
+
+  if [[ ${requested_target} == worker && ${active_state} != "${desired_state}" ]]; then
+    printf '%s\n' all
+  else
+    printf '%s\n' "${requested_target}"
+  fi
+}
+
+function apply_gpu_s3_coordinator_config() {
+  local enabled=$1
+  local reader_mode=$2
+  local config_dir=$3
+  local baseline_coordinator_catalog=$4
+  local coordinator_catalog="${config_dir}/etc_coordinator/catalog/hive.properties"
+  local node_selection_strategy
+
+  [[ -f ${coordinator_catalog} ]] || return 0
+  node_selection_strategy=$(
+    gpu_s3_node_selection_strategy \
+      "${enabled}" "${reader_mode}" "${baseline_coordinator_catalog}"
+  ) || return 1
+
+  remove_properties_file_key_if_present \
+    "hive.node-selection-strategy" "${coordinator_catalog}"
+  if [[ -n ${node_selection_strategy} ]]; then
+    set_properties_file_value_exact \
+      "hive.node-selection-strategy" \
+      "${node_selection_strategy}" \
+      "${coordinator_catalog}"
+  fi
+}
+
+function render_gpu_s3_coordinator_state_override() {
+  local enabled=$1
+  local reader_mode=$2
+  local baseline_coordinator_catalog=$3
+  local output_path=$4
+  local state
+
+  state=$(
+    gpu_s3_node_selection_state \
+      "${enabled}" "${reader_mode}" "${baseline_coordinator_catalog}"
+  ) || return 1
+
+  {
+    printf 'services:\n'
+    printf '  presto-coordinator:\n'
+    printf '    labels:\n'
+    printf '      %s: "%s"\n' \
+      "${GPU_S3_NODE_SELECTION_STATE_LABEL}" "${state}"
+  } > "${output_path}"
 }
 
 function apply_s3_direct_receive_worker_catalogs() {

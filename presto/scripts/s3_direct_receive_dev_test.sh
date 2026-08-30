@@ -200,6 +200,7 @@ SCRIPT_DIR=${ORIGINAL_SCRIPT_DIR}
 
 CONFIG_ROOT="${TEST_ROOT}/config"
 BASELINE="${TEST_ROOT}/baseline.properties"
+COORDINATOR_BASELINE="${TEST_ROOT}/coordinator-baseline.properties"
 mkdir -p \
   "${CONFIG_ROOT}/etc_worker/catalog" \
   "${CONFIG_ROOT}/etc_worker_0/catalog" \
@@ -207,6 +208,10 @@ mkdir -p \
 printf '%s\n' \
   'connector.name=hive-hadoop2' \
   'cudf.hive.use-buffered-input=true' > "${BASELINE}"
+printf '%s\n' \
+  'connector.name=hive-hadoop2' \
+  '# hive.node-selection-strategy=SOFT_AFFINITY' \
+  > "${COORDINATOR_BASELINE}"
 for file in \
   "${CONFIG_ROOT}/etc_worker/catalog/hive.properties" \
   "${CONFIG_ROOT}/etc_worker_0/catalog/hive.properties" \
@@ -216,6 +221,78 @@ for file in \
     'hive.s3.direct-receive-mode=stale' \
     'cudf.hive.use-buffered-input=stale' > "${file}"
 done
+
+apply_gpu_s3_coordinator_config \
+  true buffered-cache "${CONFIG_ROOT}" "${COORDINATOR_BASELINE}"
+apply_gpu_s3_coordinator_config \
+  true buffered-cache "${CONFIG_ROOT}" "${COORDINATOR_BASELINE}"
+COORDINATOR_CATALOG="${CONFIG_ROOT}/etc_coordinator/catalog/hive.properties"
+[[ $(grep -c '^hive.node-selection-strategy=SOFT_AFFINITY$' "${COORDINATOR_CATALOG}") -eq 1 ]] ||
+  fail 'GPU buffered-cache mode did not enable soft affinity exactly once'
+gpu_s3_coordinator_requires_restart \
+  true buffered-cache "${COORDINATOR_BASELINE}" \
+  "${GPU_S3_NODE_SELECTION_STATE_UNSET}" ||
+  fail 'entering buffered-cache did not require a coordinator restart'
+if gpu_s3_coordinator_requires_restart \
+  true buffered-cache "${COORDINATOR_BASELINE}" SOFT_AFFINITY; then
+  fail 'unchanged buffered-cache policy required a coordinator restart'
+fi
+[[ $(gpu_s3_restart_target_for_coordinator_state \
+  worker true buffered-cache "${COORDINATOR_BASELINE}" \
+  "${GPU_S3_NODE_SELECTION_STATE_UNSET}") == all ]] ||
+  fail 'worker-only transition did not widen to an all-service restart'
+[[ $(gpu_s3_restart_target_for_coordinator_state \
+  worker true buffered-cache "${COORDINATOR_BASELINE}" SOFT_AFFINITY) == worker ]] ||
+  fail 'matching coordinator policy did not retain the worker-only fast path'
+[[ $(gpu_s3_restart_target_for_coordinator_state \
+  worker true buffered-cache "${COORDINATOR_BASELINE}" UNKNOWN) == all ]] ||
+  fail 'unknown coordinator state did not fail safely to an all-service restart'
+[[ $(gpu_s3_restart_target_for_coordinator_state \
+  coordinator true buffered-cache "${COORDINATOR_BASELINE}" \
+  "${GPU_S3_NODE_SELECTION_STATE_UNSET}") == coordinator ]] ||
+  fail 'explicit coordinator-only restart was unexpectedly widened'
+
+COORDINATOR_STATE_OVERRIDE="${TEST_ROOT}/coordinator-state.yml"
+render_gpu_s3_coordinator_state_override \
+  true buffered-cache "${COORDINATOR_BASELINE}" \
+  "${COORDINATOR_STATE_OVERRIDE}"
+assert_contains \
+  "${GPU_S3_NODE_SELECTION_STATE_LABEL}: \"SOFT_AFFINITY\"" \
+  "${COORDINATOR_STATE_OVERRIDE}"
+render_gpu_s3_coordinator_state_override \
+  true buffered "${COORDINATOR_BASELINE}" \
+  "${COORDINATOR_STATE_OVERRIDE}"
+assert_contains \
+  "${GPU_S3_NODE_SELECTION_STATE_LABEL}: \"${GPU_S3_NODE_SELECTION_STATE_UNSET}\"" \
+  "${COORDINATOR_STATE_OVERRIDE}"
+
+for mode in kvikio buffered; do
+  apply_gpu_s3_coordinator_config \
+    true "${mode}" "${CONFIG_ROOT}" "${COORDINATOR_BASELINE}"
+  assert_not_contains 'hive.node-selection-strategy=' "${COORDINATOR_CATALOG}"
+done
+
+printf '%s\n' \
+  'connector.name=hive-hadoop2' \
+  'hive.node-selection-strategy=NO_PREFERENCE' \
+  > "${COORDINATOR_BASELINE}"
+apply_gpu_s3_coordinator_config \
+  false kvikio "${CONFIG_ROOT}" "${COORDINATOR_BASELINE}"
+[[ $(grep -c '^hive.node-selection-strategy=NO_PREFERENCE$' "${COORDINATOR_CATALOG}") -eq 1 ]] ||
+  fail 'disabled direct receive did not restore the coordinator baseline'
+gpu_s3_coordinator_requires_restart \
+  false kvikio "${COORDINATOR_BASELINE}" SOFT_AFFINITY ||
+  fail 'leaving buffered-cache did not require a coordinator restart'
+if gpu_s3_coordinator_requires_restart \
+  false kvikio "${COORDINATOR_BASELINE}" NO_PREFERENCE; then
+  fail 'matching coordinator baseline required a restart'
+fi
+
+# Restore the ordinary commented baseline for the remaining catalog tests.
+printf '%s\n' \
+  'connector.name=hive-hadoop2' \
+  '# hive.node-selection-strategy=SOFT_AFFINITY' \
+  > "${COORDINATOR_BASELINE}"
 for file in \
   "${CONFIG_ROOT}/etc_worker/config_native.properties" \
   "${CONFIG_ROOT}/etc_worker_0/config_native.properties"; do
@@ -505,6 +582,10 @@ assert_not_contains 'apply_s3_direct_receive_kvikio_defaults' "${CPU_LAUNCHER}"
 assert_contains '--s3-reader-mode' "${GPU_LAUNCHER}"
 assert_contains 'PRESTO_DEV_GPU_S3_READER_MODE' "${GPU_LAUNCHER}"
 assert_contains 'apply_gpu_worker_memory_and_cache_config' "${GPU_LAUNCHER}"
+assert_contains 'apply_gpu_s3_coordinator_config' "${GPU_LAUNCHER}"
+assert_contains 'reconcile_gpu_s3_coordinator_restart_target' "${GPU_LAUNCHER}"
+assert_contains 'render_gpu_s3_coordinator_state_override' "${GPU_LAUNCHER}"
+assert_contains 'COMPOSE_FILE_ARGS+=(-f "${GPU_S3_COORDINATOR_STATE_OVERRIDE_PATH}")' "${GPU_LAUNCHER}"
 assert_not_contains '--s3-reader-mode' "${CPU_LAUNCHER}"
 assert_contains 'config/template/etc_worker/catalog/hive.properties' "${GPU_LAUNCHER}"
 assert_contains 'ARG S3_DIRECT_RECEIVE=OFF' "${NATIVE_DOCKERFILE}"
