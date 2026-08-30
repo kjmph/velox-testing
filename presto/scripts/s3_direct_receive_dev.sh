@@ -43,6 +43,20 @@ function apply_s3_direct_receive_kvikio_defaults() {
   export KVIKIO_REMOTE_IO_REACTOR_DISPATCH="${KVIKIO_REMOTE_IO_REACTOR_DISPATCH:-PER_CHUNK}"
 }
 
+function normalize_gpu_s3_reader_mode() {
+  local mode=${1,,}
+
+  case ${mode} in
+    kvikio|buffered|buffered-cache)
+      printf '%s\n' "${mode}"
+      ;;
+    *)
+      echo "ERROR: GPU S3 reader mode must be kvikio, buffered, or buffered-cache; got '${1}'." >&2
+      return 1
+      ;;
+  esac
+}
+
 function resolve_s3_direct_receive_credential_source() {
   local requested_source=${1,,}
   local has_access_key=false
@@ -178,8 +192,13 @@ function apply_s3_direct_receive_worker_catalogs() {
   local enabled=$2
   local config_dir=$3
   local baseline_worker_catalog=${4:-}
+  local gpu_reader_mode=${5:-kvikio}
   local hive_config
   local baseline_buffered_input=''
+
+  if [[ ${variant} == gpu && ${enabled} == true ]]; then
+    gpu_reader_mode=$(normalize_gpu_s3_reader_mode "${gpu_reader_mode}") || return 1
+  fi
 
   if [[ ${variant} == gpu && -f ${baseline_worker_catalog} ]]; then
     baseline_buffered_input=$(
@@ -203,15 +222,101 @@ function apply_s3_direct_receive_worker_catalogs() {
       set_properties_file_value_exact \
         "hive.s3.direct-receive-mode" "caller-buffer" "${hive_config}"
     fi
-    if [[ ${enabled} == true && ${variant} == gpu ]]; then
+    if [[ ${enabled} == true && ${variant} == gpu && ${gpu_reader_mode} == kvikio ]]; then
       set_properties_file_value_exact \
         "cudf.hive.use-buffered-input" "false" "${hive_config}"
+    elif [[ ${enabled} == true && ${variant} == gpu ]]; then
+      # Buffered cuDF reads use Velox's S3 filesystem. Keep the same patched
+      # dependency chain as the KvikIO arm and receive directly into the
+      # caller-owned host buffer, which may be an AsyncDataCache entry.
+      set_properties_file_value_exact \
+        "hive.s3.direct-receive-mode" "caller-buffer" "${hive_config}"
+      set_properties_file_value_exact \
+        "cudf.hive.use-buffered-input" "true" "${hive_config}"
     elif [[ ${variant} == gpu && -n ${baseline_buffered_input} ]]; then
       set_properties_file_value_exact \
         "cudf.hive.use-buffered-input" \
         "${baseline_buffered_input}" "${hive_config}"
     fi
   done
+}
+
+function apply_gpu_worker_memory_and_cache_config() {
+  local reader_mode=$1
+  local config_dir=$2
+  local num_workers=$3
+  local host_ram_gb=$4
+  local cache_enabled=false
+  local default_host_reserve_gb
+  local host_reserve_gb
+  local worker_envelope_gb
+  local system_mem_limit_gb
+  local system_mem_gb
+  local query_mem_gb
+  local cfg
+
+  reader_mode=$(normalize_gpu_s3_reader_mode "${reader_mode}") || return 1
+  if [[ ${reader_mode} == buffered-cache ]]; then
+    cache_enabled=true
+  fi
+
+  if [[ ! ${num_workers} =~ ^[1-9][0-9]*$ || ! ${host_ram_gb} =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: GPU memory sizing requires positive integer worker and host-RAM counts." >&2
+    return 1
+  fi
+
+  # Leave the coordinator, OS, container runtime, and non-Velox allocations a
+  # host-wide reserve. Large benchmark hosts reserve 200 GiB; smaller hosts use
+  # 10%, with a 32-GiB floor. Divide only the remainder among worker processes.
+  default_host_reserve_gb=$(( host_ram_gb / 10 ))
+  (( default_host_reserve_gb < 32 )) && default_host_reserve_gb=32
+  (( default_host_reserve_gb > 200 )) && default_host_reserve_gb=200
+  host_reserve_gb=${GPU_HOST_RESERVE_GB:-${default_host_reserve_gb}}
+  if [[ ! ${host_reserve_gb} =~ ^[1-9][0-9]*$ || ${host_reserve_gb} -ge ${host_ram_gb} ]]; then
+    echo "ERROR: GPU_HOST_RESERVE_GB must be a positive integer smaller than host RAM." >&2
+    return 1
+  fi
+
+  worker_envelope_gb=$(( (host_ram_gb - host_reserve_gb) / num_workers ))
+  if (( worker_envelope_gb <= 10 )); then
+    echo "ERROR: GPU worker memory envelope is too small after reserving host memory." >&2
+    return 1
+  fi
+
+  system_mem_limit_gb=${GPU_SYSTEM_MEM_LIMIT_GB:-${worker_envelope_gb}}
+  system_mem_gb=${GPU_SYSTEM_MEM_GB:-$(( system_mem_limit_gb - 10 ))}
+  query_mem_gb=${GPU_QUERY_MEM_GB:-$(( system_mem_gb * 70 / 100 ))}
+  for value in "${system_mem_limit_gb}" "${system_mem_gb}" "${query_mem_gb}"; do
+    if [[ ! ${value} =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: GPU memory overrides must be positive integer GiB values." >&2
+      return 1
+    fi
+  done
+  if (( query_mem_gb >= system_mem_gb || system_mem_gb > system_mem_limit_gb )); then
+    echo "ERROR: GPU memory sizing must satisfy query < system <= system limit." >&2
+    return 1
+  fi
+  if (( system_mem_limit_gb * num_workers > host_ram_gb - host_reserve_gb )); then
+    echo "ERROR: aggregate GPU worker memory limits exceed host RAM after the reserve." >&2
+    return 1
+  fi
+
+  for cfg in "${config_dir}"/etc_worker*/config_native.properties; do
+    [[ -f ${cfg} ]] || continue
+    set_properties_file_value_exact "system-memory-gb" "${system_mem_gb}" "${cfg}"
+    set_properties_file_value_exact "query-memory-gb" "${query_mem_gb}" "${cfg}"
+    set_properties_file_value_exact \
+      "query.max-memory-per-node" "${query_mem_gb}GB" "${cfg}"
+    set_properties_file_value_exact \
+      "system-mem-limit-gb" "${system_mem_limit_gb}" "${cfg}"
+    set_properties_file_value_exact \
+      "async-data-cache-enabled" "${cache_enabled}" "${cfg}"
+  done
+
+  printf 'GPU worker memory: host=%sGB reserve=%sGB workers=%s system=%sGB query=%sGB limit=%sGB cache=%s\n' \
+    "${host_ram_gb}" "${host_reserve_gb}" "${num_workers}" \
+    "${system_mem_gb}" "${query_mem_gb}" "${system_mem_limit_gb}" \
+    "${cache_enabled}"
 }
 
 function render_s3_direct_receive_compose_override() {

@@ -19,6 +19,7 @@ DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 DEV_CUDF_SOURCE="${PRESTO_DEV_CUDF_SOURCE:-}"
 DEV_S3_DIRECT_RECEIVE="${PRESTO_DEV_S3_DIRECT_RECEIVE:-false}"
 DEV_S3_CREDENTIAL_SOURCE="${PRESTO_DEV_S3_CREDENTIAL_SOURCE:-auto}"
+DEV_GPU_S3_READER_MODE="${PRESTO_DEV_GPU_S3_READER_MODE:-kvikio}"
 DEV_ARGS=()
 
 print_dev_help() {
@@ -70,12 +71,22 @@ DEV_OPTIONS:
         context root. Can also be set with PRESTO_DEV_CUDF_SOURCE.
     --s3-direct-receive
         Build and run GPU workers with the isolated S3 direct-receive
-        dependency chain and strict KvikIO direct receive. Can also be set
+        dependency chain. The default reader mode is strict KvikIO direct
+        receive. Can also be set
         with PRESTO_DEV_S3_DIRECT_RECEIVE=true. The ordinary dependency image,
         worker image, and native object cache remain untouched.
         Defaults KvikIO to MULTI_POLL, strict direct receive, 16 MiB tasks,
         64 concurrent requests, four reactors, and PER_CHUNK dispatch. Set the
         corresponding KVIKIO_* environment variable to override any value.
+    --s3-reader-mode kvikio|buffered|buffered-cache
+        Select the GPU reader while retaining the isolated direct-receive
+        dependency chain. "kvikio" receives through KvikIO without the Velox
+        host cache. "buffered" receives through Velox/AWS SDK caller buffers
+        without caching. "buffered-cache" adds Velox AsyncDataCache. Supplying
+        this option implies --s3-direct-receive. Can also be set with
+        PRESTO_DEV_GPU_S3_READER_MODE when direct receive is enabled.
+        GPU_HOST_RESERVE_GB, GPU_SYSTEM_MEM_LIMIT_GB, GPU_SYSTEM_MEM_GB, and
+        GPU_QUERY_MEM_GB override the safe per-worker host-memory calculation.
     --s3-credential-source auto|environment|instance-profile
         Select runtime S3 credentials for direct receive. Auto forwards
         long-lived environment credentials, uses refreshable EC2 instance-role
@@ -203,6 +214,11 @@ while [[ $# -gt 0 ]]; do
       DEV_S3_DIRECT_RECEIVE=true
       shift
       ;;
+    --s3-reader-mode)
+      DEV_GPU_S3_READER_MODE=${2:?Error: --s3-reader-mode requires a value}
+      DEV_S3_DIRECT_RECEIVE=true
+      shift 2
+      ;;
     --s3-credential-source)
       DEV_S3_CREDENTIAL_SOURCE=${2:?Error: --s3-credential-source requires a value}
       shift 2
@@ -224,6 +240,16 @@ if ! DEV_PRESTO_DEPENDENCIES="$(normalize_dev_bool "$DEV_PRESTO_DEPENDENCIES" "P
   exit 1
 fi
 if ! DEV_S3_DIRECT_RECEIVE="$(normalize_dev_bool "$DEV_S3_DIRECT_RECEIVE" "PRESTO_DEV_S3_DIRECT_RECEIVE")"; then
+  exit 1
+fi
+
+# shellcheck source=s3_direct_receive_dev.sh
+source "${SCRIPT_DIR}/s3_direct_receive_dev.sh"
+if ! DEV_GPU_S3_READER_MODE="$(normalize_gpu_s3_reader_mode "${DEV_GPU_S3_READER_MODE}")"; then
+  exit 1
+fi
+if [[ ${DEV_S3_DIRECT_RECEIVE} != true && ${DEV_GPU_S3_READER_MODE} != kvikio ]]; then
+  echo "ERROR: buffered GPU S3 reader modes require --s3-direct-receive." >&2
   exit 1
 fi
 
@@ -284,9 +310,6 @@ set -- "${DEV_ARGS[@]}"
 set +u
 source "${SCRIPT_DIR}/start_presto_helper_parse_args.sh"
 set -u
-
-# shellcheck source=s3_direct_receive_dev.sh
-source "${SCRIPT_DIR}/s3_direct_receive_dev.sh"
 
 S3_DIRECT_CREDENTIAL_SOURCE=instance-profile
 if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
@@ -351,7 +374,9 @@ GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}"
 if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
   DEPS_IMAGE="${S3_DIRECT_DEPS_IMAGE:-$(derive_s3_direct_dependency_image_name "${ORDINARY_DEPS_IMAGE}")}"
   GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"
-  apply_s3_direct_receive_kvikio_defaults
+  if [[ ${DEV_GPU_S3_READER_MODE} == kvikio ]]; then
+    apply_s3_direct_receive_kvikio_defaults
+  fi
 fi
 GENERIC_DEPS_IMAGE="${GENERIC_DEPS_IMAGE:-presto/prestissimo-dependency:centos9}"
 export DEPS_IMAGE
@@ -1134,7 +1159,14 @@ fi
 apply_s3_direct_receive_worker_catalogs \
   gpu "${DEV_S3_DIRECT_RECEIVE}" \
   "${SCRIPT_DIR}/../docker/config/generated/gpu" \
-  "${SCRIPT_DIR}/../docker/config/template/etc_worker/catalog/hive.properties"
+  "${SCRIPT_DIR}/../docker/config/template/etc_worker/catalog/hive.properties" \
+  "${DEV_GPU_S3_READER_MODE}"
+GPU_HOST_RAM_GB=$(lsmem -b | awk '/Total online memory/ { print int($4 / (1024*1024*1024)); exit }')
+apply_gpu_worker_memory_and_cache_config \
+  "${DEV_GPU_S3_READER_MODE}" \
+  "${SCRIPT_DIR}/../docker/config/generated/gpu" \
+  "${NUM_WORKERS}" \
+  "${GPU_HOST_RAM_GB}"
 apply_dev_node_addresses
 apply_dev_cudf_tuning
 apply_dev_discovery_tuning
@@ -1174,14 +1206,16 @@ if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
     "${S3_DIRECT_CREDENTIAL_SOURCE}" \
     "${S3_DIRECT_WORKER_SERVICES[@]}"
   COMPOSE_FILE_ARGS+=(-f "$S3_DIRECT_OVERRIDE_PATH")
-  echo "S3 direct receive enabled for GPU workers (${DEPS_IMAGE})"
-  printf 'KvikIO S3 tuning: backend=%s direct-receive=%s task-size=%s max-concurrent-requests=%s reactors=%s dispatch=%s\n' \
-    "${KVIKIO_REMOTE_IO_BACKEND}" \
-    "${KVIKIO_REMOTE_DIRECT_RECEIVE}" \
-    "${KVIKIO_TASK_SIZE}" \
-    "${KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS}" \
-    "${KVIKIO_REMOTE_IO_NUM_REACTORS}" \
-    "${KVIKIO_REMOTE_IO_REACTOR_DISPATCH}"
+  echo "S3 direct receive enabled for GPU workers (${DEPS_IMAGE}); reader=${DEV_GPU_S3_READER_MODE}"
+  if [[ ${DEV_GPU_S3_READER_MODE} == kvikio ]]; then
+    printf 'KvikIO S3 tuning: backend=%s direct-receive=%s task-size=%s max-concurrent-requests=%s reactors=%s dispatch=%s\n' \
+      "${KVIKIO_REMOTE_IO_BACKEND}" \
+      "${KVIKIO_REMOTE_DIRECT_RECEIVE}" \
+      "${KVIKIO_TASK_SIZE}" \
+      "${KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS}" \
+      "${KVIKIO_REMOTE_IO_NUM_REACTORS}" \
+      "${KVIKIO_REMOTE_IO_REACTOR_DISPATCH}"
+  fi
 fi
 if build_targets_include "$COORDINATOR_SERVICE"; then
   COORDINATOR_DEV_OVERRIDE_PATH="$(render_dev_coordinator_override "$RENDERED_DIR")"

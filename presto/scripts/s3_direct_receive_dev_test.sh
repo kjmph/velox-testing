@@ -216,6 +216,16 @@ for file in \
     'hive.s3.direct-receive-mode=stale' \
     'cudf.hive.use-buffered-input=stale' > "${file}"
 done
+for file in \
+  "${CONFIG_ROOT}/etc_worker/config_native.properties" \
+  "${CONFIG_ROOT}/etc_worker_0/config_native.properties"; do
+  printf '%s\n' \
+    'system-memory-gb=stale' \
+    'query-memory-gb=stale' \
+    'query.max-memory-per-node=stale' \
+    'system-mem-limit-gb=stale' \
+    'async-data-cache-enabled=stale' > "${file}"
+done
 
 apply_s3_direct_receive_worker_catalogs cpu true "${CONFIG_ROOT}" "${BASELINE}"
 for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
@@ -238,11 +248,76 @@ for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   assert_not_contains 'hive.s3.direct-receive-mode=' "${file}"
 done
 
+for mode in buffered buffered-cache; do
+  apply_s3_direct_receive_worker_catalogs \
+    gpu true "${CONFIG_ROOT}" "${BASELINE}" "${mode}"
+  for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
+    [[ $(grep -c '^cudf.hive.use-buffered-input=true$' "${file}") -eq 1 ]] ||
+      fail "GPU ${mode} mode did not enable buffered input exactly once in ${file}"
+    [[ $(grep -c '^hive.s3.direct-receive-mode=caller-buffer$' "${file}") -eq 1 ]] ||
+      fail "GPU ${mode} mode did not enable caller-buffer receive exactly once in ${file}"
+  done
+done
+
+if apply_s3_direct_receive_worker_catalogs \
+  gpu true "${CONFIG_ROOT}" "${BASELINE}" invalid-mode 2>/dev/null; then
+  fail 'invalid GPU S3 reader mode was accepted by catalog reconciliation'
+fi
+
 apply_s3_direct_receive_worker_catalogs gpu false "${CONFIG_ROOT}" "${BASELINE}"
 for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   [[ $(grep -c '^cudf.hive.use-buffered-input=true$' "${file}") -eq 1 ]] ||
     fail "GPU disabled mode did not restore the ordinary baseline in ${file}"
+  assert_not_contains 'hive.s3.direct-receive-mode=' "${file}"
 done
+
+unset GPU_HOST_RESERVE_GB GPU_SYSTEM_MEM_LIMIT_GB \
+  GPU_SYSTEM_MEM_GB GPU_QUERY_MEM_GB || true
+for mode in kvikio buffered; do
+  memory_summary=$(apply_gpu_worker_memory_and_cache_config \
+    "${mode}" "${CONFIG_ROOT}" 8 2032)
+  assert_contains 'cache=false' <(printf '%s\n' "${memory_summary}")
+  for file in "${CONFIG_ROOT}"/etc_worker*/config_native.properties; do
+    [[ $(grep -c '^system-memory-gb=219$' "${file}") -eq 1 ]] ||
+      fail "GPU ${mode} mode did not set system memory exactly once in ${file}"
+    [[ $(grep -c '^query-memory-gb=153$' "${file}") -eq 1 ]] ||
+      fail "GPU ${mode} mode did not reserve cache headroom in ${file}"
+    [[ $(grep -c '^query.max-memory-per-node=153GB$' "${file}") -eq 1 ]] ||
+      fail "GPU ${mode} mode did not set the coordinator-visible query limit in ${file}"
+    [[ $(grep -c '^system-mem-limit-gb=229$' "${file}") -eq 1 ]] ||
+      fail "GPU ${mode} mode did not bound the worker process in ${file}"
+    [[ $(grep -c '^async-data-cache-enabled=false$' "${file}") -eq 1 ]] ||
+      fail "GPU ${mode} mode unexpectedly enabled the async cache in ${file}"
+  done
+done
+
+memory_summary=$(apply_gpu_worker_memory_and_cache_config \
+  buffered-cache "${CONFIG_ROOT}" 8 2032)
+assert_contains 'cache=true' <(printf '%s\n' "${memory_summary}")
+for file in "${CONFIG_ROOT}"/etc_worker*/config_native.properties; do
+  [[ $(grep -c '^async-data-cache-enabled=true$' "${file}") -eq 1 ]] ||
+    fail "GPU buffered-cache mode did not enable the async cache in ${file}"
+done
+
+export GPU_HOST_RESERVE_GB=200
+export GPU_SYSTEM_MEM_LIMIT_GB=220
+export GPU_SYSTEM_MEM_GB=210
+export GPU_QUERY_MEM_GB=140
+apply_gpu_worker_memory_and_cache_config \
+  buffered-cache "${CONFIG_ROOT}" 8 2032 >/dev/null
+for file in "${CONFIG_ROOT}"/etc_worker*/config_native.properties; do
+  assert_contains 'system-mem-limit-gb=220' "${file}"
+  assert_contains 'system-memory-gb=210' "${file}"
+  assert_contains 'query-memory-gb=140' "${file}"
+  assert_contains 'query.max-memory-per-node=140GB' "${file}"
+done
+export GPU_SYSTEM_MEM_LIMIT_GB=230
+if apply_gpu_worker_memory_and_cache_config \
+  buffered-cache "${CONFIG_ROOT}" 8 2032 >/dev/null 2>&1; then
+  fail 'aggregate GPU worker memory overcommit was accepted'
+fi
+unset GPU_HOST_RESERVE_GB GPU_SYSTEM_MEM_LIMIT_GB \
+  GPU_SYSTEM_MEM_GB GPU_QUERY_MEM_GB
 
 clear_aws_credential_env
 [[ $(resolve_s3_direct_receive_credential_source auto) == instance-profile ]] ||
@@ -427,6 +502,10 @@ assert_contains 'CPU_WORKER_IMAGE="${CPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-
 assert_contains 'GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"' "${GPU_LAUNCHER}"
 assert_contains 'apply_s3_direct_receive_kvikio_defaults' "${GPU_LAUNCHER}"
 assert_not_contains 'apply_s3_direct_receive_kvikio_defaults' "${CPU_LAUNCHER}"
+assert_contains '--s3-reader-mode' "${GPU_LAUNCHER}"
+assert_contains 'PRESTO_DEV_GPU_S3_READER_MODE' "${GPU_LAUNCHER}"
+assert_contains 'apply_gpu_worker_memory_and_cache_config' "${GPU_LAUNCHER}"
+assert_not_contains '--s3-reader-mode' "${CPU_LAUNCHER}"
 assert_contains 'config/template/etc_worker/catalog/hive.properties' "${GPU_LAUNCHER}"
 assert_contains 'ARG S3_DIRECT_RECEIVE=OFF' "${NATIVE_DOCKERFILE}"
 assert_contains '-DVELOX_ENABLE_S3_DIRECT_RECEIVE=ON' "${NATIVE_DOCKERFILE}"
