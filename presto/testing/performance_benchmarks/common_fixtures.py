@@ -164,7 +164,9 @@ def benchmark_query(request, presto_cursor, benchmark_queries, benchmark_result_
                         )
             raw_times_dict[query_id] = result
         except Exception as e:
-            failed_queries_dict[query_id] = f"{e.error_type}: {e.error_name}"
+            error_type = getattr(e, "error_type", type(e).__name__)
+            error_name = getattr(e, "error_name", str(e))
+            failed_queries_dict[query_id] = f"{error_type}: {error_name}"
             raw_times_dict[query_id] = None
             raise
         finally:
