@@ -1061,7 +1061,11 @@ function compute_cuda_architectures() {
     exit 1
   fi
 
-  nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n 1 | sed 's/\.//g'
+  # Consume the complete nvidia-smi output before selecting the first GPU.
+  # With pipefail enabled, using `head -n 1` can make nvidia-smi fail with
+  # SIGPIPE on multi-GPU hosts and silently terminate this launcher.
+  nvidia-smi --query-gpu=compute_cap --format=csv,noheader |
+    awk 'NR == 1 { gsub(/\./, ""); architecture = $0 } END { print architecture }'
 }
 
 conditionally_add_build_target "$COORDINATOR_IMAGE" "$COORDINATOR_SERVICE" "coordinator|c"
