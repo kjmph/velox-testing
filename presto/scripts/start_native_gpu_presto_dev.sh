@@ -18,6 +18,7 @@ DEV_UCX_SOURCE="${PRESTO_DEV_UCX_SOURCE:-}"
 DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 DEV_CUDF_SOURCE="${PRESTO_DEV_CUDF_SOURCE:-}"
 DEV_S3_DIRECT_RECEIVE="${PRESTO_DEV_S3_DIRECT_RECEIVE:-false}"
+DEV_S3_CREDENTIAL_SOURCE="${PRESTO_DEV_S3_CREDENTIAL_SOURCE:-auto}"
 DEV_ARGS=()
 
 print_dev_help() {
@@ -72,6 +73,11 @@ DEV_OPTIONS:
         dependency chain and strict KvikIO direct receive. Can also be set
         with PRESTO_DEV_S3_DIRECT_RECEIVE=true. The ordinary dependency image,
         worker image, and native object cache remain untouched.
+    --s3-credential-source auto|environment|instance-profile
+        Select runtime S3 credentials for direct receive. Auto forwards
+        long-lived environment credentials, uses refreshable EC2 instance-role
+        credentials when none are set, and rejects ambiguous temporary credentials.
+        Can also be set with PRESTO_DEV_S3_CREDENTIAL_SOURCE.
 
 START_OPTIONS:
     Accepts the same GPU options as start_native_gpu_presto.sh, including:
@@ -194,6 +200,10 @@ while [[ $# -gt 0 ]]; do
       DEV_S3_DIRECT_RECEIVE=true
       shift
       ;;
+    --s3-credential-source)
+      DEV_S3_CREDENTIAL_SOURCE=${2:?Error: --s3-credential-source requires a value}
+      shift 2
+      ;;
     *)
       DEV_ARGS+=("$1")
       shift
@@ -274,6 +284,19 @@ set -u
 
 # shellcheck source=s3_direct_receive_dev.sh
 source "${SCRIPT_DIR}/s3_direct_receive_dev.sh"
+
+S3_DIRECT_CREDENTIAL_SOURCE=instance-profile
+if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
+  if ! S3_DIRECT_CREDENTIAL_SOURCE="$(
+    resolve_s3_direct_receive_credential_source "${DEV_S3_CREDENTIAL_SOURCE}"
+  )"; then
+    exit 1
+  fi
+  echo "Using S3 credential source: ${S3_DIRECT_CREDENTIAL_SOURCE}"
+  if [[ ${S3_DIRECT_CREDENTIAL_SOURCE} == environment && -n ${AWS_SESSION_TOKEN:-} ]]; then
+    echo "WARNING: temporary AWS environment credentials are fixed for the lifetime of the recreated containers." >&2
+  fi
+fi
 
 function effective_velox_source() {
   if [[ -n "$DEV_VELOX_SOURCE" ]]; then
@@ -1146,6 +1169,7 @@ if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
   S3_DIRECT_OVERRIDE_PATH="${RENDERED_DIR}/docker-compose.gpu-dev-s3-direct.yml"
   render_s3_direct_receive_compose_override \
     gpu true "${GPU_WORKER_IMAGE}" "${S3_DIRECT_OVERRIDE_PATH}" \
+    "${S3_DIRECT_CREDENTIAL_SOURCE}" \
     "${S3_DIRECT_WORKER_SERVICES[@]}"
   COMPOSE_FILE_ARGS+=(-f "$S3_DIRECT_OVERRIDE_PATH")
   echo "S3 direct receive enabled for GPU workers (${DEPS_IMAGE})"

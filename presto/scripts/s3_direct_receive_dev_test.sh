@@ -44,6 +44,22 @@ assert_occurs_before() {
     fail "${file} does not place '${first}' before '${second}'"
 }
 
+clear_aws_credential_env() {
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN || true
+}
+
+assert_credential_source_fails() {
+  local source=$1
+  local message=$2
+  local error_file="${TEST_ROOT}/credential-source-error.txt"
+
+  if resolve_s3_direct_receive_credential_source "${source}" \
+    > /dev/null 2> "${error_file}"; then
+    fail "credential source '${source}' unexpectedly succeeded"
+  fi
+  assert_contains "${message}" "${error_file}"
+}
+
 [[ $(derive_s3_direct_dependency_image_name repo/image:ordinary) == repo/image:ordinary-s3-direct ]] ||
   fail 'tagged image derivation failed'
 [[ $(derive_s3_direct_dependency_image_name repo/image) == repo/image:s3-direct ]] ||
@@ -182,16 +198,72 @@ for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
     fail "GPU disabled mode did not restore the ordinary baseline in ${file}"
 done
 
+clear_aws_credential_env
+[[ $(resolve_s3_direct_receive_credential_source auto) == instance-profile ]] ||
+  fail 'auto mode did not select the instance profile without environment credentials'
+assert_credential_source_fails environment \
+  'environment S3 credentials require AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY'
+
+export AWS_ACCESS_KEY_ID='AKIA_TEST_ACCESS_KEY'
+assert_credential_source_fails auto \
+  'AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must either both be set or both be unset'
+assert_credential_source_fails environment \
+  'AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must either both be set or both be unset'
+
+clear_aws_credential_env
+export AWS_SECRET_ACCESS_KEY='TEST_SECRET_KEY'
+assert_credential_source_fails auto \
+  'AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must either both be set or both be unset'
+
+clear_aws_credential_env
+export AWS_SESSION_TOKEN='TEST_SESSION_TOKEN'
+assert_credential_source_fails auto \
+  'AWS_SESSION_TOKEN requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY'
+
+export AWS_ACCESS_KEY_ID='AKIA_TEST_ACCESS_KEY'
+assert_credential_source_fails auto \
+  'AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must either both be set or both be unset'
+
+clear_aws_credential_env
+export AWS_SECRET_ACCESS_KEY='TEST_SECRET_KEY'
+export AWS_SESSION_TOKEN='TEST_SESSION_TOKEN'
+assert_credential_source_fails environment \
+  'AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must either both be set or both be unset'
+
+export AWS_ACCESS_KEY_ID='AKIA_TEST_ACCESS_KEY'
+unset AWS_SESSION_TOKEN
+[[ $(resolve_s3_direct_receive_credential_source auto) == environment ]] ||
+  fail 'auto mode did not select complete long-lived environment credentials'
+[[ $(resolve_s3_direct_receive_credential_source environment) == environment ]] ||
+  fail 'explicit environment mode rejected complete long-lived credentials'
+
+export AWS_SESSION_TOKEN='TEST_SESSION_TOKEN'
+assert_credential_source_fails auto \
+  'auto S3 credential selection will not snapshot temporary AWS environment credentials'
+[[ $(resolve_s3_direct_receive_credential_source environment) == environment ]] ||
+  fail 'explicit environment mode rejected complete temporary credentials'
+[[ $(resolve_s3_direct_receive_credential_source instance-profile) == instance-profile ]] ||
+  fail 'instance-profile mode did not suppress complete environment credentials'
+
+export AWS_ACCESS_KEY_ID='ASIA_TEST_TEMPORARY_KEY'
+unset AWS_SESSION_TOKEN
+assert_credential_source_fails environment \
+  'temporary AWS access keys require AWS_SESSION_TOKEN'
+assert_credential_source_fails invalid-source \
+  'S3 credential source must be auto, environment, or instance-profile'
+
 export AWS_ACCESS_KEY_ID='SENTINEL_ACCESS_KEY_MUST_NOT_BE_RENDERED'
 export AWS_SECRET_ACCESS_KEY='SENTINEL_SECRET_KEY_MUST_NOT_BE_RENDERED'
 export AWS_SESSION_TOKEN='SENTINEL_SESSION_TOKEN_MUST_NOT_BE_RENDERED'
 export AWS_REGION='SENTINEL_REGION_MUST_NOT_BE_RENDERED'
 export AWS_ENDPOINT_URL='https://sentinel-endpoint-must-not-be-rendered.invalid'
+export AWS_EC2_METADATA_SERVICE_ENDPOINT='http://sentinel-imds-must-not-be-rendered.invalid'
 export KVIKIO_REMOTE_DIRECT_RECEIVE='SENTINEL_KVIKIO_VALUE_MUST_NOT_BE_RENDERED'
 
 CPU_OVERRIDE="${TEST_ROOT}/cpu-direct.yml"
 render_s3_direct_receive_compose_override \
   cpu true 'presto-native-worker-cpu:test-s3-direct' "${CPU_OVERRIDE}" \
+  environment \
   presto-native-worker-cpu-0 presto-native-worker-cpu-1
 assert_contains 'image: "presto-native-worker-cpu:test-s3-direct"' "${CPU_OVERRIDE}"
 assert_contains '  presto-coordinator:' "${CPU_OVERRIDE}"
@@ -202,6 +274,7 @@ assert_not_contains 'KVIKIO_REMOTE_IO_BACKEND:' "${CPU_OVERRIDE}"
 GPU_OVERRIDE="${TEST_ROOT}/gpu-direct.yml"
 render_s3_direct_receive_compose_override \
   gpu true 'presto-native-worker-gpu:test-s3-direct' "${GPU_OVERRIDE}" \
+  environment \
   presto-native-worker-gpu
 assert_contains '  presto-coordinator:' "${GPU_OVERRIDE}"
 assert_contains 'AWS_SESSION_TOKEN:' "${GPU_OVERRIDE}"
@@ -217,7 +290,7 @@ for sentinel in SENTINEL_ACCESS SENTINEL_SECRET SENTINEL_SESSION \
   assert_not_contains "${sentinel}" "${GPU_OVERRIDE}"
 done
 for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
-  AWS_REGION AWS_DEFAULT_REGION AWS_ENDPOINT_URL; do
+  AWS_REGION AWS_DEFAULT_REGION AWS_ENDPOINT_URL AWS_EC2_METADATA_SERVICE_ENDPOINT; do
   [[ $(grep -Fxc "      ${variable}:" "${CPU_OVERRIDE}") -eq 3 ]] ||
     fail "CPU override did not forward ${variable} to the coordinator and both workers"
   [[ $(grep -Fxc "      ${variable}:" "${GPU_OVERRIDE}") -eq 2 ]] ||
@@ -230,9 +303,44 @@ for variable in KVIKIO_REMOTE_IO_BACKEND KVIKIO_REMOTE_DIRECT_RECEIVE \
     fail "GPU override did not render ${variable} as a blank mapping"
 done
 
+CPU_PROVIDER_OVERRIDE="${TEST_ROOT}/cpu-instance-profile.yml"
+render_s3_direct_receive_compose_override \
+  cpu true 'presto-native-worker-cpu:test-s3-direct' \
+  "${CPU_PROVIDER_OVERRIDE}" instance-profile \
+  presto-native-worker-cpu-0 presto-native-worker-cpu-1
+GPU_PROVIDER_OVERRIDE="${TEST_ROOT}/gpu-instance-profile.yml"
+render_s3_direct_receive_compose_override \
+  gpu true 'presto-native-worker-gpu:test-s3-direct' \
+  "${GPU_PROVIDER_OVERRIDE}" instance-profile presto-native-worker-gpu
+for override in "${CPU_PROVIDER_OVERRIDE}" "${GPU_PROVIDER_OVERRIDE}"; do
+  for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+    assert_not_contains "${variable}:" "${override}"
+  done
+  for variable in AWS_REGION AWS_DEFAULT_REGION AWS_ENDPOINT_URL \
+    AWS_EC2_METADATA_SERVICE_ENDPOINT; do
+    assert_contains "      ${variable}:" "${override}"
+  done
+  for sentinel in SENTINEL_ACCESS SENTINEL_SECRET SENTINEL_SESSION \
+    SENTINEL_REGION sentinel-endpoint sentinel-imds; do
+    assert_not_contains "${sentinel}" "${override}"
+  done
+done
+assert_not_contains 'KVIKIO_REMOTE_IO_BACKEND:' "${CPU_PROVIDER_OVERRIDE}"
+assert_contains 'KVIKIO_REMOTE_IO_BACKEND:' "${GPU_PROVIDER_OVERRIDE}"
+
+INVALID_OVERRIDE="${TEST_ROOT}/invalid-source.yml"
+if render_s3_direct_receive_compose_override \
+  gpu true ignored "${INVALID_OVERRIDE}" auto presto-native-worker-gpu \
+  2> "${TEST_ROOT}/invalid-render-source.txt"; then
+  fail 'compose renderer accepted an unresolved credential source'
+fi
+assert_contains 'compose rendering requires a resolved S3 credential source' \
+  "${TEST_ROOT}/invalid-render-source.txt"
+
 DISABLED_OVERRIDE="${TEST_ROOT}/disabled.yml"
 render_s3_direct_receive_compose_override \
-  gpu false ignored "${DISABLED_OVERRIDE}" presto-native-worker-gpu
+  gpu false ignored "${DISABLED_OVERRIDE}" instance-profile \
+  presto-native-worker-gpu
 [[ ! -s ${DISABLED_OVERRIDE} ]] ||
   fail 'disabled mode rendered a credential-forwarding override'
 
@@ -244,6 +352,9 @@ COMMON_COMPOSE="${SCRIPT_DIR}/../docker/docker-compose.common.yml"
 for launcher in "${CPU_LAUNCHER}" "${GPU_LAUNCHER}"; do
   assert_contains '--s3-direct-receive' "${launcher}"
   assert_contains 'PRESTO_DEV_S3_DIRECT_RECEIVE' "${launcher}"
+  assert_contains '--s3-credential-source' "${launcher}"
+  assert_contains 'PRESTO_DEV_S3_CREDENTIAL_SOURCE' "${launcher}"
+  assert_contains 'resolve_s3_direct_receive_credential_source' "${launcher}"
   assert_contains '--build-arg "S3_DIRECT_RECEIVE=' "${launcher}"
   assert_contains 'isolate_s3_direct_cache_scope' "${launcher}"
   assert_contains 'bind_native_cache_scope_to_dependency_image' "${launcher}"

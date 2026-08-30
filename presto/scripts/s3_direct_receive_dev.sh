@@ -4,17 +4,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Shared, source-only helpers for the CPU and GPU developer launchers. Keep
-# credentials out of generated files: the compose override below declares
-# variable names with null values so Compose copies values from the launcher's
-# environment directly into the coordinator and worker containers.
+# credentials out of generated files: environment mode declares credential
+# names with null values so Compose copies them from the launcher environment.
+# Instance-profile mode omits those names, allowing in-container providers to
+# discover and refresh EC2 role credentials without snapshotting the host environment.
 
-S3_DIRECT_RECEIVE_AWS_ENV=(
+S3_DIRECT_RECEIVE_AWS_CREDENTIAL_ENV=(
   AWS_ACCESS_KEY_ID
   AWS_SECRET_ACCESS_KEY
   AWS_SESSION_TOKEN
+)
+S3_DIRECT_RECEIVE_AWS_ROUTING_ENV=(
   AWS_REGION
   AWS_DEFAULT_REGION
   AWS_ENDPOINT_URL
+  AWS_EC2_METADATA_SERVICE_ENDPOINT
 )
 S3_DIRECT_RECEIVE_KVIKIO_ENV=(
   KVIKIO_REMOTE_IO_BACKEND
@@ -22,6 +26,64 @@ S3_DIRECT_RECEIVE_KVIKIO_ENV=(
   KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE
   KVIKIO_REMOTE_DIRECT_RECEIVE_MAX_PINNED_BYTES
 )
+
+function resolve_s3_direct_receive_credential_source() {
+  local requested_source=${1,,}
+  local has_access_key=false
+  local has_secret_key=false
+  local has_session_token=false
+
+  [[ -n ${AWS_ACCESS_KEY_ID:-} ]] && has_access_key=true
+  [[ -n ${AWS_SECRET_ACCESS_KEY:-} ]] && has_secret_key=true
+  [[ -n ${AWS_SESSION_TOKEN:-} ]] && has_session_token=true
+
+  case ${requested_source} in
+    instance-profile)
+      printf '%s\n' instance-profile
+      return 0
+      ;;
+    auto|environment)
+      ;;
+    *)
+      echo "ERROR: S3 credential source must be auto, environment, or instance-profile; got '${requested_source}'." >&2
+      return 1
+      ;;
+  esac
+
+  if [[ ${has_access_key} != "${has_secret_key}" ]]; then
+    echo "ERROR: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must either both be set or both be unset." >&2
+    return 1
+  fi
+  if [[ ${has_session_token} == true && ${has_access_key} == false ]]; then
+    echo "ERROR: AWS_SESSION_TOKEN requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY." >&2
+    return 1
+  fi
+  if [[ ${has_access_key} == true && ${AWS_ACCESS_KEY_ID} == ASIA* && ${has_session_token} == false ]]; then
+    echo "ERROR: temporary AWS access keys require AWS_SESSION_TOKEN." >&2
+    return 1
+  fi
+
+  if [[ ${requested_source} == environment ]]; then
+    if [[ ${has_access_key} == false ]]; then
+      echo "ERROR: environment S3 credentials require AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY." >&2
+      return 1
+    fi
+    printf '%s\n' environment
+    return 0
+  fi
+
+  if [[ ${has_access_key} == false ]]; then
+    printf '%s\n' instance-profile
+    return 0
+  fi
+  if [[ ${has_session_token} == true ]]; then
+    echo "ERROR: auto S3 credential selection will not snapshot temporary AWS environment credentials." >&2
+    echo "Choose --s3-credential-source environment to forward them intentionally, or instance-profile to use refreshable EC2 role credentials." >&2
+    return 1
+  fi
+
+  printf '%s\n' environment
+}
 
 function derive_s3_direct_dependency_image_name() {
   local base_image=$1
@@ -141,7 +203,8 @@ function render_s3_direct_receive_compose_override() {
   local enabled=$2
   local worker_image=$3
   local output_path=$4
-  shift 4
+  local credential_source=$5
+  shift 5
   local worker_services=("$@")
   local service variable
 
@@ -149,22 +212,36 @@ function render_s3_direct_receive_compose_override() {
     : > "${output_path}"
     return 0
   fi
+  if [[ ${credential_source} != environment && ${credential_source} != instance-profile ]]; then
+    echo "ERROR: compose rendering requires a resolved S3 credential source; got '${credential_source}'." >&2
+    return 1
+  fi
 
   {
     printf 'services:\n'
     # The Java coordinator enumerates S3 objects and creates Hive splits, while
-    # native workers read the object bodies. Both sides need the same ambient
-    # AWS credential chain.
+    # native workers read the object bodies. Both sides use the same selected
+    # credential source and routing configuration.
     printf '  presto-coordinator:\n'
     printf '    environment:\n'
-    for variable in "${S3_DIRECT_RECEIVE_AWS_ENV[@]}"; do
+    if [[ ${credential_source} == environment ]]; then
+      for variable in "${S3_DIRECT_RECEIVE_AWS_CREDENTIAL_ENV[@]}"; do
+        printf '      %s:\n' "${variable}"
+      done
+    fi
+    for variable in "${S3_DIRECT_RECEIVE_AWS_ROUTING_ENV[@]}"; do
       printf '      %s:\n' "${variable}"
     done
     for service in "${worker_services[@]}"; do
       printf '  %s:\n' "${service}"
       printf '    image: "%s"\n' "${worker_image}"
       printf '    environment:\n'
-      for variable in "${S3_DIRECT_RECEIVE_AWS_ENV[@]}"; do
+      if [[ ${credential_source} == environment ]]; then
+        for variable in "${S3_DIRECT_RECEIVE_AWS_CREDENTIAL_ENV[@]}"; do
+          printf '      %s:\n' "${variable}"
+        done
+      fi
+      for variable in "${S3_DIRECT_RECEIVE_AWS_ROUTING_ENV[@]}"; do
         printf '      %s:\n' "${variable}"
       done
       if [[ ${variant} == gpu ]]; then
