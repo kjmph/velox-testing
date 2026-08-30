@@ -31,6 +31,18 @@ S3_DIRECT_RECEIVE_KVIKIO_ENV=(
   KVIKIO_REMOTE_DIRECT_RECEIVE_MAX_PINNED_BYTES
 )
 
+function apply_s3_direct_receive_kvikio_defaults() {
+  # These defaults are specific to the GPU S3 direct-receive path. Keep every
+  # value overridable so topology-specific experiments do not require script
+  # edits, and leave slot sizing to KvikIO until it is benchmarked separately.
+  export KVIKIO_REMOTE_IO_BACKEND="${KVIKIO_REMOTE_IO_BACKEND:-MULTI_POLL}"
+  export KVIKIO_REMOTE_DIRECT_RECEIVE="${KVIKIO_REMOTE_DIRECT_RECEIVE:-REQUIRE}"
+  export KVIKIO_TASK_SIZE="${KVIKIO_TASK_SIZE:-16777216}"
+  export KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS="${KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS:-64}"
+  export KVIKIO_REMOTE_IO_NUM_REACTORS="${KVIKIO_REMOTE_IO_NUM_REACTORS:-4}"
+  export KVIKIO_REMOTE_IO_REACTOR_DISPATCH="${KVIKIO_REMOTE_IO_REACTOR_DISPATCH:-PER_CHUNK}"
+}
+
 function resolve_s3_direct_receive_credential_source() {
   local requested_source=${1,,}
   local has_access_key=false

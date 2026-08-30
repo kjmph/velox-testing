@@ -73,6 +73,9 @@ DEV_OPTIONS:
         dependency chain and strict KvikIO direct receive. Can also be set
         with PRESTO_DEV_S3_DIRECT_RECEIVE=true. The ordinary dependency image,
         worker image, and native object cache remain untouched.
+        Defaults KvikIO to MULTI_POLL, strict direct receive, 16 MiB tasks,
+        64 concurrent requests, four reactors, and PER_CHUNK dispatch. Set the
+        corresponding KVIKIO_* environment variable to override any value.
     --s3-credential-source auto|environment|instance-profile
         Select runtime S3 credentials for direct receive. Auto forwards
         long-lived environment credentials, uses refreshable EC2 instance-role
@@ -348,8 +351,7 @@ GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}"
 if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
   DEPS_IMAGE="${S3_DIRECT_DEPS_IMAGE:-$(derive_s3_direct_dependency_image_name "${ORDINARY_DEPS_IMAGE}")}"
   GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"
-  export KVIKIO_REMOTE_IO_BACKEND="${KVIKIO_REMOTE_IO_BACKEND:-MULTI_POLL}"
-  export KVIKIO_REMOTE_DIRECT_RECEIVE="${KVIKIO_REMOTE_DIRECT_RECEIVE:-REQUIRE}"
+  apply_s3_direct_receive_kvikio_defaults
 fi
 GENERIC_DEPS_IMAGE="${GENERIC_DEPS_IMAGE:-presto/prestissimo-dependency:centos9}"
 export DEPS_IMAGE
@@ -1173,6 +1175,13 @@ if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
     "${S3_DIRECT_WORKER_SERVICES[@]}"
   COMPOSE_FILE_ARGS+=(-f "$S3_DIRECT_OVERRIDE_PATH")
   echo "S3 direct receive enabled for GPU workers (${DEPS_IMAGE})"
+  printf 'KvikIO S3 tuning: backend=%s direct-receive=%s task-size=%s max-concurrent-requests=%s reactors=%s dispatch=%s\n' \
+    "${KVIKIO_REMOTE_IO_BACKEND}" \
+    "${KVIKIO_REMOTE_DIRECT_RECEIVE}" \
+    "${KVIKIO_TASK_SIZE}" \
+    "${KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS}" \
+    "${KVIKIO_REMOTE_IO_NUM_REACTORS}" \
+    "${KVIKIO_REMOTE_IO_REACTOR_DISPATCH}"
 fi
 if build_targets_include "$COORDINATOR_SERVICE"; then
   COORDINATOR_DEV_OVERRIDE_PATH="$(render_dev_coordinator_override "$RENDERED_DIR")"

@@ -44,6 +44,52 @@ assert_occurs_before() {
     fail "${file} does not place '${first}' before '${second}'"
 }
 
+unset KVIKIO_REMOTE_IO_BACKEND \
+  KVIKIO_REMOTE_DIRECT_RECEIVE \
+  KVIKIO_TASK_SIZE \
+  KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS \
+  KVIKIO_REMOTE_IO_NUM_REACTORS \
+  KVIKIO_REMOTE_IO_REACTOR_DISPATCH || true
+apply_s3_direct_receive_kvikio_defaults
+[[ ${KVIKIO_REMOTE_IO_BACKEND} == MULTI_POLL ]] ||
+  fail 'default KvikIO remote backend is not MULTI_POLL'
+[[ ${KVIKIO_REMOTE_DIRECT_RECEIVE} == REQUIRE ]] ||
+  fail 'default KvikIO direct-receive mode is not REQUIRE'
+[[ ${KVIKIO_TASK_SIZE} == 16777216 ]] ||
+  fail 'default KvikIO task size is not 16 MiB'
+[[ ${KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS} == 64 ]] ||
+  fail 'default KvikIO request concurrency is not 64'
+[[ ${KVIKIO_REMOTE_IO_NUM_REACTORS} == 4 ]] ||
+  fail 'default KvikIO reactor count is not four'
+[[ ${KVIKIO_REMOTE_IO_REACTOR_DISPATCH} == PER_CHUNK ]] ||
+  fail 'default KvikIO reactor dispatch is not PER_CHUNK'
+
+export KVIKIO_REMOTE_IO_BACKEND=override-backend
+export KVIKIO_REMOTE_DIRECT_RECEIVE=override-direct-receive
+export KVIKIO_TASK_SIZE=override-task-size
+export KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS=override-request-limit
+export KVIKIO_REMOTE_IO_NUM_REACTORS=override-reactors
+export KVIKIO_REMOTE_IO_REACTOR_DISPATCH=override-dispatch
+apply_s3_direct_receive_kvikio_defaults
+[[ ${KVIKIO_REMOTE_IO_BACKEND} == override-backend ]] ||
+  fail 'explicit KvikIO remote backend was overwritten'
+[[ ${KVIKIO_REMOTE_DIRECT_RECEIVE} == override-direct-receive ]] ||
+  fail 'explicit KvikIO direct-receive mode was overwritten'
+[[ ${KVIKIO_TASK_SIZE} == override-task-size ]] ||
+  fail 'explicit KvikIO task size was overwritten'
+[[ ${KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS} == override-request-limit ]] ||
+  fail 'explicit KvikIO request concurrency was overwritten'
+[[ ${KVIKIO_REMOTE_IO_NUM_REACTORS} == override-reactors ]] ||
+  fail 'explicit KvikIO reactor count was overwritten'
+[[ ${KVIKIO_REMOTE_IO_REACTOR_DISPATCH} == override-dispatch ]] ||
+  fail 'explicit KvikIO reactor dispatch was overwritten'
+unset KVIKIO_REMOTE_IO_BACKEND \
+  KVIKIO_REMOTE_DIRECT_RECEIVE \
+  KVIKIO_TASK_SIZE \
+  KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS \
+  KVIKIO_REMOTE_IO_NUM_REACTORS \
+  KVIKIO_REMOTE_IO_REACTOR_DISPATCH
+
 clear_aws_credential_env() {
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN || true
 }
@@ -379,8 +425,8 @@ done
 assert_contains 'CPU_WORKER_IMAGE="${CPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"' "${CPU_LAUNCHER}"
 # shellcheck disable=SC2016
 assert_contains 'GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"' "${GPU_LAUNCHER}"
-assert_contains 'KVIKIO_REMOTE_IO_BACKEND:-MULTI_POLL' "${GPU_LAUNCHER}"
-assert_contains 'KVIKIO_REMOTE_DIRECT_RECEIVE:-REQUIRE' "${GPU_LAUNCHER}"
+assert_contains 'apply_s3_direct_receive_kvikio_defaults' "${GPU_LAUNCHER}"
+assert_not_contains 'apply_s3_direct_receive_kvikio_defaults' "${CPU_LAUNCHER}"
 assert_contains 'config/template/etc_worker/catalog/hive.properties' "${GPU_LAUNCHER}"
 assert_contains 'ARG S3_DIRECT_RECEIVE=OFF' "${NATIVE_DOCKERFILE}"
 assert_contains '-DVELOX_ENABLE_S3_DIRECT_RECEIVE=ON' "${NATIVE_DOCKERFILE}"
