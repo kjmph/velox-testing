@@ -47,6 +47,36 @@ function isolate_s3_direct_cache_scope() {
   fi
 }
 
+function native_cache_scope_for_dependency_image_id() {
+  local scope=$1
+  local image_id=$2
+  local digest=${image_id#sha256:}
+
+  if [[ ! ${digest} =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "ERROR: invalid dependency image ID '${image_id}'" >&2
+    return 1
+  fi
+
+  # CMake records absolute paths and other discovery results from the build
+  # image in its persistent build directory. Bind that directory to the
+  # immutable image ID so replacing a mutable dependency-image tag cannot
+  # reuse configuration or objects produced against its predecessor.
+  printf '%s-deps-%s\n' "${scope}" "${digest}"
+}
+
+function bind_native_cache_scope_to_dependency_image() {
+  local scope=$1
+  local image=$2
+  local image_id
+
+  if ! image_id=$(docker image inspect --format '{{.Id}}' "${image}"); then
+    echo "ERROR: could not inspect dependency image '${image}'" >&2
+    return 1
+  fi
+
+  native_cache_scope_for_dependency_image_id "${scope}" "${image_id}"
+}
+
 function remove_properties_file_key_if_present() {
   local key=$1
   local file=$2

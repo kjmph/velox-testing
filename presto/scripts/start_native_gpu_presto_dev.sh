@@ -82,9 +82,10 @@ START_OPTIONS:
 CACHE BEHAVIOR:
     Without --no-cache, native source changes invalidate the native build RUN
     layer via a git hash while preserving package-manager layers and BuildKit
-    build-directory cache mounts. Set NATIVE_BUILD_CACHE_SCOPE to use a
-    different persistent CMake/object cache namespace. Use --no-cache for a
-    full Docker layer-cache bypass.
+    build-directory cache mounts. The selected dependency image ID is included
+    in the persistent CMake/object cache namespace. Set NATIVE_BUILD_CACHE_SCOPE
+    to provide an additional namespace label. Use --no-cache for a full Docker
+    layer-cache bypass.
     Coordinator dev builds use an incremental Maven package builder and a
     generated runtime Dockerfile that installs java-17-openjdk-headless instead
     of the desktop JDK package. The generated dev Dockerfile uses a package
@@ -409,6 +410,7 @@ function compute_native_build_cache_scope() {
   {
     # Keep object caches across ordinary source edits, but rotate them when
     # the selected native toolchain or dependency-image definition changes.
+    # The selected dependency image ID is added after that image is resolved.
     echo "native-build-cache-scope-format=2"
     realpath "${REPO_ROOT}"
     realpath "$presto_source"
@@ -1187,10 +1189,7 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
     if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
       NATIVE_BUILD_CACHE_SCOPE="$(isolate_s3_direct_cache_scope "${NATIVE_BUILD_CACHE_SCOPE}")"
     fi
-    echo "Using VELOX_TESTING_SOURCE_HASH=${SOURCE_HASH}"
-    echo "Using NATIVE_BUILD_CACHE_SCOPE=${NATIVE_BUILD_CACHE_SCOPE}"
   fi
-  NATIVE_BUILD_CACHE_SCOPE="${NATIVE_BUILD_CACHE_SCOPE:-default}"
 
   if build_targets_include_gpu_worker && [[ -n "$DEV_UCX_SOURCE" ]]; then
     DEPS_BUILD_ARGS=(
@@ -1219,7 +1218,15 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
         "$(effective_velox_source)" \
         "${DIRECT_DEPS_NO_CACHE}" || exit 1
     fi
+
+    NATIVE_BUILD_CACHE_SCOPE="$(
+      bind_native_cache_scope_to_dependency_image \
+        "${NATIVE_BUILD_CACHE_SCOPE}" "${DEPS_IMAGE}"
+    )" || exit 1
+    echo "Using VELOX_TESTING_SOURCE_HASH=${SOURCE_HASH}"
+    echo "Using NATIVE_BUILD_CACHE_SCOPE=${NATIVE_BUILD_CACHE_SCOPE}"
   fi
+  NATIVE_BUILD_CACHE_SCOPE="${NATIVE_BUILD_CACHE_SCOPE:-default}"
 
   PRESTO_VERSION=testing
   PRESTO_DEV_PACKAGE_HASH="not-used"

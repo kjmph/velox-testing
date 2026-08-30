@@ -32,6 +32,18 @@ assert_not_contains() {
   fi
 }
 
+assert_occurs_before() {
+  local first=$1
+  local second=$2
+  local file=$3
+  local first_line second_line
+
+  first_line=$(awk -v needle="${first}" 'index($0, needle) { print NR; exit }' "${file}")
+  second_line=$(awk -v needle="${second}" 'index($0, needle) { print NR; exit }' "${file}")
+  [[ -n ${first_line} && -n ${second_line} && ${first_line} -lt ${second_line} ]] ||
+    fail "${file} does not place '${first}' before '${second}'"
+}
+
 [[ $(derive_s3_direct_dependency_image_name repo/image:ordinary) == repo/image:ordinary-s3-direct ]] ||
   fail 'tagged image derivation failed'
 [[ $(derive_s3_direct_dependency_image_name repo/image) == repo/image:s3-direct ]] ||
@@ -48,6 +60,29 @@ fi
   fail 'explicit cache scope was not isolated'
 [[ $(isolate_s3_direct_cache_scope explicit-s3-direct) == explicit-s3-direct ]] ||
   fail 'direct cache scope suffix was duplicated'
+DEPENDENCY_IMAGE_ID="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+[[ $(native_cache_scope_for_dependency_image_id explicit "${DEPENDENCY_IMAGE_ID}") == \
+  explicit-deps-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef ]] ||
+  fail 'dependency image ID was not incorporated into the native cache scope'
+SECOND_DEPENDENCY_IMAGE_ID="sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+[[ $(native_cache_scope_for_dependency_image_id explicit "${DEPENDENCY_IMAGE_ID}") != \
+  "$(native_cache_scope_for_dependency_image_id explicit "${SECOND_DEPENDENCY_IMAGE_ID}")" ]] ||
+  fail 'dependency image replacement did not rotate the native cache scope'
+if native_cache_scope_for_dependency_image_id explicit not-an-image-id 2>/dev/null; then
+  fail 'invalid dependency image ID was accepted'
+fi
+
+# Called indirectly by bind_native_cache_scope_to_dependency_image.
+# shellcheck disable=SC2317
+docker() {
+  [[ $* == "image inspect --format {{.Id}} dependency-image" ]] ||
+    fail "unexpected mocked docker invocation: $*"
+  printf '%s\n' "${DEPENDENCY_IMAGE_ID}"
+}
+[[ $(bind_native_cache_scope_to_dependency_image explicit dependency-image) == \
+  explicit-deps-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef ]] ||
+  fail 'dependency image was not bound to the native cache scope'
+unset -f docker
 
 ORIGINAL_SCRIPT_DIR=${SCRIPT_DIR}
 MOCK_SCRIPT_DIR="${TEST_ROOT}/mock-scripts"
@@ -211,7 +246,12 @@ for launcher in "${CPU_LAUNCHER}" "${GPU_LAUNCHER}"; do
   assert_contains 'PRESTO_DEV_S3_DIRECT_RECEIVE' "${launcher}"
   assert_contains '--build-arg "S3_DIRECT_RECEIVE=' "${launcher}"
   assert_contains 'isolate_s3_direct_cache_scope' "${launcher}"
+  assert_contains 'bind_native_cache_scope_to_dependency_image' "${launcher}"
   assert_contains 'ensure_s3_direct_dependency_image' "${launcher}"
+  assert_occurs_before \
+    'ensure_s3_direct_dependency_image' \
+    'bind_native_cache_scope_to_dependency_image' \
+    "${launcher}"
 done
 # The following assertions intentionally match literal shell/Docker variables.
 # shellcheck disable=SC2016
