@@ -127,9 +127,11 @@ CUDF DEV TUNING:
     PRESTO_CUDF_AST_EXPRESSION_PRIORITY=<integer>
     PRESTO_CUDF_JIT_EXPRESSION_ENABLED=true|false
     PRESTO_CUDF_MEMORY_RESOURCE=cuda|pool|async|arena|managed|managed_pool|managed_async|prefetch_managed|prefetch_managed_pool|prefetch_managed_async
-    PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default 50000000)
+    PRESTO_CUDF_PARTITIONED_OUTPUT_BATCH_ROWS=<positive integer rows> (default 100000000)
+    PRESTO_CUDF_PARTITIONED_OUTPUT_MAX_BATCH_ROWS=<positive integer rows> (default unset)
+    PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default 100000000)
     PRESTO_CUDF_BATCH_SIZE_MAX_THRESHOLD=<positive integer rows> (default unset)
-    PRESTO_CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default 150000000)
+    PRESTO_CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default unset)
     VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN=1
 
 Examples:
@@ -758,6 +760,8 @@ function apply_dev_cudf_tuning() {
   local ast_expression_priority="${PRESTO_CUDF_AST_EXPRESSION_PRIORITY:-${CUDF_AST_EXPRESSION_PRIORITY:-}}"
   local jit_expression_enabled="${PRESTO_CUDF_JIT_EXPRESSION_ENABLED:-${CUDF_JIT_EXPRESSION_ENABLED:-}}"
   local memory_resource="${PRESTO_CUDF_MEMORY_RESOURCE:-${CUDF_MEMORY_RESOURCE:-async}}"
+  local partitioned_output_batch_rows="${PRESTO_CUDF_PARTITIONED_OUTPUT_BATCH_ROWS:-${CUDF_PARTITIONED_OUTPUT_BATCH_ROWS:-100000000}}"
+  local partitioned_output_max_batch_rows="${PRESTO_CUDF_PARTITIONED_OUTPUT_MAX_BATCH_ROWS:-${CUDF_PARTITIONED_OUTPUT_MAX_BATCH_ROWS:-}}"
   local batch_size_min_threshold="${PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD:-${CUDF_BATCH_SIZE_MIN_THRESHOLD:-100000000}}"
   local batch_size_max_threshold="${PRESTO_CUDF_BATCH_SIZE_MAX_THRESHOLD:-${CUDF_BATCH_SIZE_MAX_THRESHOLD:-}}"
   local final_agg_batch_size_min_threshold="${PRESTO_CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD:-${CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD:-}}"
@@ -788,6 +792,15 @@ function apply_dev_cudf_tuning() {
     exit 1
   fi
 
+  if [[ ! "$partitioned_output_batch_rows" =~ ^[0-9]+$ || "$partitioned_output_batch_rows" -le 0 ]]; then
+    echo "ERROR: PRESTO_CUDF_PARTITIONED_OUTPUT_BATCH_ROWS must be a positive integer row count." >&2
+    exit 1
+  fi
+  if [[ -n "$partitioned_output_max_batch_rows" &&
+        ( ! "$partitioned_output_max_batch_rows" =~ ^[0-9]+$ || "$partitioned_output_max_batch_rows" -le 0 ) ]]; then
+    echo "ERROR: PRESTO_CUDF_PARTITIONED_OUTPUT_MAX_BATCH_ROWS must be a positive integer row count." >&2
+    exit 1
+  fi
   if [[ ! "$batch_size_min_threshold" =~ ^[0-9]+$ || "$batch_size_min_threshold" -le 0 ]]; then
     echo "ERROR: PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD must be a positive integer row count." >&2
     exit 1
@@ -844,6 +857,12 @@ function apply_dev_cudf_tuning() {
       set_properties_file_value "cudf.jit_expression_enabled" "$jit_expression_enabled" "$worker_config"
     fi
     set_properties_file_value "cudf.memory_resource" "$memory_resource" "$worker_config"
+    set_properties_file_value "cudf.partitioned_output_batch_rows" "$partitioned_output_batch_rows" "$worker_config"
+    if [[ -n "$partitioned_output_max_batch_rows" ]]; then
+      set_properties_file_value "cudf.partitioned_output_max_batch_rows" "$partitioned_output_max_batch_rows" "$worker_config"
+    else
+      remove_properties_file_key "cudf.partitioned_output_max_batch_rows" "$worker_config"
+    fi
     set_properties_file_value "cudf.batch_size_min_threshold" "$batch_size_min_threshold" "$worker_config"
     if [[ -n "$batch_size_max_threshold" ]]; then
       set_properties_file_value "cudf.batch_size_max_threshold" "$batch_size_max_threshold" "$worker_config"
@@ -870,6 +889,8 @@ function apply_dev_cudf_tuning() {
   message="${message} cudf.ast_expression_priority=${ast_expression_priority:-<default>}"
   message="${message} cudf.jit_expression_enabled=${jit_expression_enabled:-<default>}"
   message="${message} cudf.memory_resource=${memory_resource}"
+  message="${message} cudf.partitioned_output_batch_rows=${partitioned_output_batch_rows}"
+  message="${message} cudf.partitioned_output_max_batch_rows=${partitioned_output_max_batch_rows:-<unset>}"
   message="${message} cudf.batch_size_min_threshold=${batch_size_min_threshold}"
   if [[ -n "$batch_size_max_threshold" ]]; then
     message="${message} cudf.batch_size_max_threshold=${batch_size_max_threshold}"
