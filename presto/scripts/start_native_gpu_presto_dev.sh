@@ -134,6 +134,14 @@ CUDF DEV TUNING:
     PRESTO_CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default unset)
     VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN=1
 
+UCX DEV TUNING:
+    PRESTO_GPU_UCX_TLS=<UCX transport list>
+        GPU worker transports (default: tcp,cuda_copy,cuda_ipc). Falls back to
+        the standard UCX_TLS environment variable when unset.
+    PRESTO_GPU_UCX_MAX_RNDV_RAILS=<positive integer>
+        Maximum rendezvous rails (default: 2, matching OpenUCX). Falls back to
+        the standard UCX_MAX_RNDV_RAILS environment variable when unset.
+
 Examples:
     $0 -w 2 --wait -b worker --restart-target worker
     $0 -w 2 -g 2,3 --wait -b worker --restart-target worker
@@ -166,6 +174,29 @@ function normalize_dev_bool() {
       return 1
       ;;
   esac
+}
+
+function configure_dev_gpu_ucx_environment() {
+  if [[ -n ${UCX_MAX_RDNV_RAILS:-} || -n ${PRESTO_GPU_UCX_MAX_RDNV_RAILS:-} ]]; then
+    echo "ERROR: UCX_MAX_RDNV_RAILS is misspelled; use UCX_MAX_RNDV_RAILS." >&2
+    return 1
+  fi
+
+  local tls="${PRESTO_GPU_UCX_TLS:-${UCX_TLS:-tcp,cuda_copy,cuda_ipc}}"
+  local max_rndv_rails="${PRESTO_GPU_UCX_MAX_RNDV_RAILS:-${UCX_MAX_RNDV_RAILS:-2}}"
+
+  if [[ -z "$tls" || "$tls" =~ ^[[:space:]]*$ ]]; then
+    echo "ERROR: PRESTO_GPU_UCX_TLS must contain at least one UCX transport." >&2
+    return 1
+  fi
+  if [[ ! "$max_rndv_rails" =~ ^[0-9]+$ || "$max_rndv_rails" -le 0 ]]; then
+    echo "ERROR: PRESTO_GPU_UCX_MAX_RNDV_RAILS must be a positive integer." >&2
+    return 1
+  fi
+
+  export UCX_TLS="$tls"
+  export UCX_MAX_RNDV_RAILS="$max_rndv_rails"
+  echo "Dev GPU UCX tuning: UCX_TLS=${UCX_TLS} UCX_MAX_RNDV_RAILS=${UCX_MAX_RNDV_RAILS}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -244,6 +275,9 @@ if ! DEV_PRESTO_DEPENDENCIES="$(normalize_dev_bool "$DEV_PRESTO_DEPENDENCIES" "P
   exit 1
 fi
 if ! DEV_S3_DIRECT_RECEIVE="$(normalize_dev_bool "$DEV_S3_DIRECT_RECEIVE" "PRESTO_DEV_S3_DIRECT_RECEIVE")"; then
+  exit 1
+fi
+if ! configure_dev_gpu_ucx_environment; then
   exit 1
 fi
 

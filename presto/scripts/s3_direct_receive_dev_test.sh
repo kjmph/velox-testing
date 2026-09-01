@@ -32,6 +32,26 @@ assert_not_contains() {
   fi
 }
 
+assert_gpu_launcher_rejects_ucx_environment() {
+  local expected_message=$1
+  shift
+  local error_file="${TEST_ROOT}/gpu-ucx-environment-error.txt"
+
+  if env \
+    -u UCX_TLS \
+    -u PRESTO_GPU_UCX_TLS \
+    -u UCX_MAX_RNDV_RAILS \
+    -u PRESTO_GPU_UCX_MAX_RNDV_RAILS \
+    -u UCX_MAX_RDNV_RAILS \
+    -u PRESTO_GPU_UCX_MAX_RDNV_RAILS \
+    "$@" \
+    "${GPU_LAUNCHER}" --restart-target none \
+    > /dev/null 2> "${error_file}"; then
+    fail 'GPU launcher accepted an invalid UCX environment'
+  fi
+  assert_contains "${expected_message}" "${error_file}"
+}
+
 assert_occurs_before() {
   local first=$1
   local second=$2
@@ -554,6 +574,7 @@ render_s3_direct_receive_compose_override \
 
 CPU_LAUNCHER="${SCRIPT_DIR}/start_native_cpu_presto_dev.sh"
 GPU_LAUNCHER="${SCRIPT_DIR}/start_native_gpu_presto_dev.sh"
+GPU_COMPOSE_TEMPLATE="${SCRIPT_DIR}/../docker/docker-compose/template/docker-compose.native-gpu.yml.jinja"
 NATIVE_DOCKERFILE="${SCRIPT_DIR}/../docker/native_build.dockerfile"
 ADAPTERS_DOCKERFILE="${SCRIPT_DIR}/../../velox/docker/adapters_build.dockerfile"
 COMMON_COMPOSE="${SCRIPT_DIR}/../docker/docker-compose.common.yml"
@@ -584,9 +605,27 @@ assert_contains 'PRESTO_DEV_GPU_S3_READER_MODE' "${GPU_LAUNCHER}"
 assert_contains 'apply_gpu_worker_memory_and_cache_config' "${GPU_LAUNCHER}"
 assert_contains 'apply_gpu_s3_coordinator_config' "${GPU_LAUNCHER}"
 assert_contains 'reconcile_gpu_s3_coordinator_restart_target' "${GPU_LAUNCHER}"
+assert_contains 'configure_dev_gpu_ucx_environment' "${GPU_LAUNCHER}"
+assert_contains 'PRESTO_GPU_UCX_TLS' "${GPU_LAUNCHER}"
+assert_contains 'PRESTO_GPU_UCX_MAX_RNDV_RAILS' "${GPU_LAUNCHER}"
+assert_gpu_launcher_rejects_ucx_environment \
+  'UCX_MAX_RDNV_RAILS is misspelled; use UCX_MAX_RNDV_RAILS.' \
+  UCX_MAX_RDNV_RAILS=1
+assert_gpu_launcher_rejects_ucx_environment \
+  'PRESTO_GPU_UCX_MAX_RNDV_RAILS must be a positive integer.' \
+  UCX_MAX_RNDV_RAILS=zero
+assert_gpu_launcher_rejects_ucx_environment \
+  'PRESTO_GPU_UCX_TLS must contain at least one UCX transport.' \
+  'UCX_TLS= '
 assert_contains 'render_gpu_s3_coordinator_state_override' "${GPU_LAUNCHER}"
 assert_contains 'COMPOSE_FILE_ARGS+=(-f "${GPU_S3_COORDINATOR_STATE_OVERRIDE_PATH}")' "${GPU_LAUNCHER}"
 assert_not_contains '--s3-reader-mode' "${CPU_LAUNCHER}"
+# shellcheck disable=SC2016
+[[ $(grep -Fxc '      UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"' "${GPU_COMPOSE_TEMPLATE}") -eq 3 ]] ||
+  fail 'GPU compose template does not forward UCX_TLS to every worker layout'
+# shellcheck disable=SC2016
+[[ $(grep -Fxc '      UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"' "${GPU_COMPOSE_TEMPLATE}") -eq 3 ]] ||
+  fail 'GPU compose template does not forward UCX_MAX_RNDV_RAILS to every worker layout'
 assert_contains 'config/template/etc_worker/catalog/hive.properties' "${GPU_LAUNCHER}"
 assert_contains 'ARG S3_DIRECT_RECEIVE=OFF' "${NATIVE_DOCKERFILE}"
 assert_contains '-DVELOX_ENABLE_S3_DIRECT_RECEIVE=ON' "${NATIVE_DOCKERFILE}"
