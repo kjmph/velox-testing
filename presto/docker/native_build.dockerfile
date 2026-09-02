@@ -213,6 +213,8 @@ RUN set -euxo pipefail; \
         grep -F 'Aws::Http::GetDirectResponseReceiveApiVersionV2()' >/dev/null; \
       nm -D -C --defined-only "${aws_core}" | \
         grep -F 'Aws::Http::GetDirectResponseReceiveStrictKernelTlsApiVersionV1()' >/dev/null; \
+      nm -D -C --defined-only "${aws_core}" | \
+        grep -F 'Aws::Http::GetAdaptiveTcpMssApiVersionV1()' >/dev/null; \
     fi
 
 COPY velox-testing/presto/docker/launch_presto_servers.sh velox-testing/presto/docker/presto_profiling_wrapper.sh /opt

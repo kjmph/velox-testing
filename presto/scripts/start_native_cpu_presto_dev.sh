@@ -17,6 +17,7 @@ DEV_PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
 DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 DEV_S3_DIRECT_RECEIVE="${PRESTO_DEV_S3_DIRECT_RECEIVE:-false}"
 DEV_S3_CREDENTIAL_SOURCE="${PRESTO_DEV_S3_CREDENTIAL_SOURCE:-auto}"
+DEV_S3_ADAPTIVE_TCP_MSS="${PRESTO_DEV_S3_ADAPTIVE_TCP_MSS:-auto}"
 DEV_ARGS=()
 
 print_dev_help() {
@@ -69,6 +70,11 @@ DEV_OPTIONS:
         long-lived environment credentials, uses refreshable EC2 instance-role
         credentials when none are set, and rejects ambiguous temporary credentials.
         Can also be set with PRESTO_DEV_S3_CREDENTIAL_SOURCE.
+    --s3-adaptive-tcp-mss auto|on|off
+        Control adaptive reuse of jumbo-capable AWS SDK curl connections.
+        Auto (default) enables it for the CPU direct-receive path. On requires
+        --s3-direct-receive; off provides an explicit control experiment.
+        Can also be set with PRESTO_DEV_S3_ADAPTIVE_TCP_MSS.
 
 START_OPTIONS:
     Accepts the same CPU options as start_native_cpu_presto.sh, including:
@@ -172,6 +178,10 @@ while [[ $# -gt 0 ]]; do
       DEV_S3_CREDENTIAL_SOURCE=${2:?Error: --s3-credential-source requires a value}
       shift 2
       ;;
+    --s3-adaptive-tcp-mss)
+      DEV_S3_ADAPTIVE_TCP_MSS=${2:?Error: --s3-adaptive-tcp-mss requires a value}
+      shift 2
+      ;;
     *)
       DEV_ARGS+=("$1")
       shift
@@ -237,6 +247,18 @@ set -u
 # shellcheck source=s3_direct_receive_dev.sh
 source "${SCRIPT_DIR}/s3_direct_receive_dev.sh"
 
+if ! DEV_S3_ADAPTIVE_TCP_MSS="$(
+  normalize_s3_adaptive_tcp_mss_mode "${DEV_S3_ADAPTIVE_TCP_MSS}"
+)"; then
+  exit 1
+fi
+if ! S3_ADAPTIVE_TCP_MSS_ENABLED="$(
+  resolve_s3_adaptive_tcp_mss_enabled \
+    cpu "${DEV_S3_DIRECT_RECEIVE}" buffered "${DEV_S3_ADAPTIVE_TCP_MSS}"
+)"; then
+  exit 1
+fi
+
 S3_DIRECT_CREDENTIAL_SOURCE=instance-profile
 if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
   if ! S3_DIRECT_CREDENTIAL_SOURCE="$(
@@ -248,6 +270,7 @@ if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
   if [[ ${S3_DIRECT_CREDENTIAL_SOURCE} == environment && -n ${AWS_SESSION_TOKEN:-} ]]; then
     echo "WARNING: temporary AWS environment credentials are fixed for the lifetime of the recreated containers." >&2
   fi
+  echo "S3 adaptive TCP MSS: mode=${DEV_S3_ADAPTIVE_TCP_MSS} effective=${S3_ADAPTIVE_TCP_MSS_ENABLED}"
 fi
 
 function effective_velox_source() {
@@ -860,7 +883,8 @@ fi
 apply_s3_direct_receive_worker_catalogs \
   cpu "${DEV_S3_DIRECT_RECEIVE}" \
   "${SCRIPT_DIR}/../docker/config/generated/cpu" \
-  "${SCRIPT_DIR}/../docker/config/template/etc_worker/catalog/hive.properties"
+  "${SCRIPT_DIR}/../docker/config/template/etc_worker/catalog/hive.properties" \
+  buffered "${DEV_S3_ADAPTIVE_TCP_MSS}"
 apply_dev_node_addresses
 apply_dev_discovery_tuning
 

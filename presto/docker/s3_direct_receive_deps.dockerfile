@@ -55,6 +55,8 @@ RUN curl_library=$(readlink -f /opt/presto-s3-direct/lib/libcurl.so.4) && \
       grep -F 'Aws::Http::GetDirectResponseReceiveApiVersionV2()' >/dev/null && \
     nm -D -C --defined-only "${aws_core_library}" | \
       grep -F 'Aws::Http::GetDirectResponseReceiveStrictKernelTlsApiVersionV1()' >/dev/null && \
+    nm -D -C --defined-only "${aws_core_library}" | \
+      grep -F 'Aws::Http::GetAdaptiveTcpMssApiVersionV1()' >/dev/null && \
     ldd_output=$( \
       LD_LIBRARY_PATH="/opt/presto-s3-direct/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
         ldd "${aws_core_library}" \

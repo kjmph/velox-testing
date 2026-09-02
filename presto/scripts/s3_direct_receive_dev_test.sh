@@ -110,6 +110,28 @@ unset KVIKIO_REMOTE_IO_BACKEND \
   KVIKIO_REMOTE_IO_NUM_REACTORS \
   KVIKIO_REMOTE_IO_REACTOR_DISPATCH
 
+for mode in auto on off; do
+  [[ $(normalize_s3_adaptive_tcp_mss_mode "${mode^^}") == "${mode}" ]] ||
+    fail "adaptive TCP MSS mode '${mode}' was not normalized"
+done
+if normalize_s3_adaptive_tcp_mss_mode invalid >/dev/null 2>&1; then
+  fail 'invalid adaptive TCP MSS mode was accepted'
+fi
+[[ $(resolve_s3_adaptive_tcp_mss_enabled cpu true buffered auto) == true ]] ||
+  fail 'CPU auto mode did not enable adaptive TCP MSS'
+[[ $(resolve_s3_adaptive_tcp_mss_enabled gpu true buffered-cache auto) == true ]] ||
+  fail 'GPU buffered-cache auto mode did not enable adaptive TCP MSS'
+[[ $(resolve_s3_adaptive_tcp_mss_enabled gpu true kvikio auto) == false ]] ||
+  fail 'GPU KvikIO auto mode unexpectedly enabled the AWS SDK policy'
+[[ $(resolve_s3_adaptive_tcp_mss_enabled cpu true buffered off) == false ]] ||
+  fail 'adaptive TCP MSS off mode was ignored'
+if resolve_s3_adaptive_tcp_mss_enabled gpu true kvikio on >/dev/null 2>&1; then
+  fail 'adaptive TCP MSS on mode was accepted for KvikIO'
+fi
+if resolve_s3_adaptive_tcp_mss_enabled cpu false buffered on >/dev/null 2>&1; then
+  fail 'adaptive TCP MSS on mode was accepted without direct receive'
+fi
+
 clear_aws_credential_env() {
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN || true
 }
@@ -239,6 +261,7 @@ for file in \
   printf '%s\n' \
     'connector.name=hive-hadoop2' \
     'hive.s3.direct-receive-mode=stale' \
+    'hive.s3.adaptive-tcp-mss-enabled=stale' \
     'cudf.hive.use-buffered-input=stale' > "${file}"
 done
 
@@ -328,14 +351,26 @@ apply_s3_direct_receive_worker_catalogs cpu true "${CONFIG_ROOT}" "${BASELINE}"
 for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   [[ $(grep -c '^hive.s3.direct-receive-mode=caller-buffer$' "${file}") -eq 1 ]] ||
     fail "CPU direct mode was not reconciled exactly once in ${file}"
+  [[ $(grep -c '^hive.s3.adaptive-tcp-mss-enabled=true$' "${file}") -eq 1 ]] ||
+    fail "CPU adaptive TCP MSS mode was not reconciled exactly once in ${file}"
+done
+apply_s3_direct_receive_worker_catalogs \
+  cpu true "${CONFIG_ROOT}" "${BASELINE}" buffered off
+for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
+  assert_contains 'hive.s3.direct-receive-mode=caller-buffer' "${file}"
+  assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
 done
 assert_contains \
   'hive.s3.direct-receive-mode=stale' \
+  "${CONFIG_ROOT}/etc_coordinator/catalog/hive.properties"
+assert_contains \
+  'hive.s3.adaptive-tcp-mss-enabled=stale' \
   "${CONFIG_ROOT}/etc_coordinator/catalog/hive.properties"
 
 apply_s3_direct_receive_worker_catalogs cpu false "${CONFIG_ROOT}" "${BASELINE}"
 for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   assert_not_contains 'hive.s3.direct-receive-mode=' "${file}"
+  assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
 done
 
 apply_s3_direct_receive_worker_catalogs gpu true "${CONFIG_ROOT}" "${BASELINE}"
@@ -343,6 +378,7 @@ for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   [[ $(grep -c '^cudf.hive.use-buffered-input=false$' "${file}") -eq 1 ]] ||
     fail "GPU direct mode was not reconciled exactly once in ${file}"
   assert_not_contains 'hive.s3.direct-receive-mode=' "${file}"
+  assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
 done
 
 for mode in buffered buffered-cache; do
@@ -353,8 +389,22 @@ for mode in buffered buffered-cache; do
       fail "GPU ${mode} mode did not enable buffered input exactly once in ${file}"
     [[ $(grep -c '^hive.s3.direct-receive-mode=caller-buffer$' "${file}") -eq 1 ]] ||
       fail "GPU ${mode} mode did not enable caller-buffer receive exactly once in ${file}"
+    [[ $(grep -c '^hive.s3.adaptive-tcp-mss-enabled=true$' "${file}") -eq 1 ]] ||
+      fail "GPU ${mode} mode did not enable adaptive TCP MSS exactly once in ${file}"
   done
 done
+
+apply_s3_direct_receive_worker_catalogs \
+  gpu true "${CONFIG_ROOT}" "${BASELINE}" buffered off
+for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
+  assert_contains 'cudf.hive.use-buffered-input=true' "${file}"
+  assert_contains 'hive.s3.direct-receive-mode=caller-buffer' "${file}"
+  assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
+done
+if apply_s3_direct_receive_worker_catalogs \
+  gpu true "${CONFIG_ROOT}" "${BASELINE}" kvikio on 2>/dev/null; then
+  fail 'catalog reconciliation enabled the AWS SDK adaptive policy for KvikIO'
+fi
 
 if apply_s3_direct_receive_worker_catalogs \
   gpu true "${CONFIG_ROOT}" "${BASELINE}" invalid-mode 2>/dev/null; then
@@ -366,6 +416,7 @@ for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   [[ $(grep -c '^cudf.hive.use-buffered-input=true$' "${file}") -eq 1 ]] ||
     fail "GPU disabled mode did not restore the ordinary baseline in ${file}"
   assert_not_contains 'hive.s3.direct-receive-mode=' "${file}"
+  assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
 done
 
 unset GPU_HOST_RESERVE_GB GPU_SYSTEM_MEM_LIMIT_GB \
@@ -576,6 +627,7 @@ CPU_LAUNCHER="${SCRIPT_DIR}/start_native_cpu_presto_dev.sh"
 GPU_LAUNCHER="${SCRIPT_DIR}/start_native_gpu_presto_dev.sh"
 GPU_COMPOSE_TEMPLATE="${SCRIPT_DIR}/../docker/docker-compose/template/docker-compose.native-gpu.yml.jinja"
 NATIVE_DOCKERFILE="${SCRIPT_DIR}/../docker/native_build.dockerfile"
+S3_DIRECT_DEPS_DOCKERFILE="${SCRIPT_DIR}/../docker/s3_direct_receive_deps.dockerfile"
 ADAPTERS_DOCKERFILE="${SCRIPT_DIR}/../../velox/docker/adapters_build.dockerfile"
 COMMON_COMPOSE="${SCRIPT_DIR}/../docker/docker-compose.common.yml"
 for launcher in "${CPU_LAUNCHER}" "${GPU_LAUNCHER}"; do
@@ -583,6 +635,9 @@ for launcher in "${CPU_LAUNCHER}" "${GPU_LAUNCHER}"; do
   assert_contains 'PRESTO_DEV_S3_DIRECT_RECEIVE' "${launcher}"
   assert_contains '--s3-credential-source' "${launcher}"
   assert_contains 'PRESTO_DEV_S3_CREDENTIAL_SOURCE' "${launcher}"
+  assert_contains '--s3-adaptive-tcp-mss' "${launcher}"
+  assert_contains 'PRESTO_DEV_S3_ADAPTIVE_TCP_MSS' "${launcher}"
+  assert_contains 'resolve_s3_adaptive_tcp_mss_enabled' "${launcher}"
   assert_contains 'resolve_s3_direct_receive_credential_source' "${launcher}"
   assert_contains '--build-arg "S3_DIRECT_RECEIVE=' "${launcher}"
   assert_contains 'isolate_s3_direct_cache_scope' "${launcher}"
@@ -637,6 +692,8 @@ assert_contains 'curl_recv_buffer_build_version_v1' "${NATIVE_DOCKERFILE}"
 assert_contains 'curl_ktls_direct_rx_build_version_v1' "${NATIVE_DOCKERFILE}"
 assert_contains 'GetDirectResponseReceiveApiVersionV2()' "${NATIVE_DOCKERFILE}"
 assert_contains 'GetDirectResponseReceiveStrictKernelTlsApiVersionV1()' "${NATIVE_DOCKERFILE}"
+assert_contains 'GetAdaptiveTcpMssApiVersionV1()' "${NATIVE_DOCKERFILE}"
+assert_contains 'GetAdaptiveTcpMssApiVersionV1()' "${S3_DIRECT_DEPS_DOCKERFILE}"
 assert_contains 'direct_prefix=/opt/presto-s3-direct/lib' "${NATIVE_DOCKERFILE}"
 # shellcheck disable=SC2016
 assert_contains 'Runtime resolved libcurl outside ${direct_prefix}' "${NATIVE_DOCKERFILE}"

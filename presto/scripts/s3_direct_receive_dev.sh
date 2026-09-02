@@ -59,6 +59,54 @@ function normalize_gpu_s3_reader_mode() {
   esac
 }
 
+function normalize_s3_adaptive_tcp_mss_mode() {
+  local mode=${1,,}
+
+  case ${mode} in
+    auto|on|off)
+      printf '%s\n' "${mode}"
+      ;;
+    *)
+      echo "ERROR: adaptive TCP MSS mode must be auto, on, or off; got '${1}'." >&2
+      return 1
+      ;;
+  esac
+}
+
+function resolve_s3_adaptive_tcp_mss_enabled() {
+  local variant=$1
+  local direct_receive_enabled=$2
+  local gpu_reader_mode=$3
+  local requested_mode
+
+  requested_mode=$(normalize_s3_adaptive_tcp_mss_mode "${4}") || return 1
+
+  case ${requested_mode} in
+    off)
+      printf '%s\n' false
+      ;;
+    auto)
+      if [[ ${direct_receive_enabled} == true &&
+            (${variant} == cpu || ${gpu_reader_mode} != kvikio) ]]; then
+        printf '%s\n' true
+      else
+        printf '%s\n' false
+      fi
+      ;;
+    on)
+      if [[ ${direct_receive_enabled} != true ]]; then
+        echo "ERROR: adaptive TCP MSS mode 'on' requires --s3-direct-receive." >&2
+        return 1
+      fi
+      if [[ ${variant} == gpu && ${gpu_reader_mode} == kvikio ]]; then
+        echo "ERROR: adaptive TCP MSS mode 'on' requires a buffered GPU S3 reader; KvikIO does not use the AWS SDK curl connection pool." >&2
+        return 1
+      fi
+      printf '%s\n' true
+      ;;
+  esac
+}
+
 function resolve_s3_direct_receive_credential_source() {
   local requested_source=${1,,}
   local has_access_key=false
@@ -315,12 +363,18 @@ function apply_s3_direct_receive_worker_catalogs() {
   local config_dir=$3
   local baseline_worker_catalog=${4:-}
   local gpu_reader_mode=${5:-kvikio}
+  local adaptive_tcp_mss_mode=${6:-auto}
+  local adaptive_tcp_mss_enabled
   local hive_config
   local baseline_buffered_input=''
 
   if [[ ${variant} == gpu && ${enabled} == true ]]; then
     gpu_reader_mode=$(normalize_gpu_s3_reader_mode "${gpu_reader_mode}") || return 1
   fi
+  adaptive_tcp_mss_enabled=$(
+    resolve_s3_adaptive_tcp_mss_enabled \
+      "${variant}" "${enabled}" "${gpu_reader_mode}" "${adaptive_tcp_mss_mode}"
+  ) || return 1
 
   if [[ ${variant} == gpu && -f ${baseline_worker_catalog} ]]; then
     baseline_buffered_input=$(
@@ -336,6 +390,8 @@ function apply_s3_direct_receive_worker_catalogs() {
     [[ -f ${hive_config} ]] || continue
     remove_properties_file_key_if_present \
       "hive.s3.direct-receive-mode" "${hive_config}"
+    remove_properties_file_key_if_present \
+      "hive.s3.adaptive-tcp-mss-enabled" "${hive_config}"
     if [[ ${variant} == gpu ]]; then
       remove_properties_file_key_if_present \
         "cudf.hive.use-buffered-input" "${hive_config}"
@@ -359,6 +415,10 @@ function apply_s3_direct_receive_worker_catalogs() {
       set_properties_file_value_exact \
         "cudf.hive.use-buffered-input" \
         "${baseline_buffered_input}" "${hive_config}"
+    fi
+    if [[ ${adaptive_tcp_mss_enabled} == true ]]; then
+      set_properties_file_value_exact \
+        "hive.s3.adaptive-tcp-mss-enabled" "true" "${hive_config}"
     fi
   done
 }

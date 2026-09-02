@@ -20,6 +20,7 @@ DEV_CUDF_SOURCE="${PRESTO_DEV_CUDF_SOURCE:-}"
 DEV_S3_DIRECT_RECEIVE="${PRESTO_DEV_S3_DIRECT_RECEIVE:-false}"
 DEV_S3_CREDENTIAL_SOURCE="${PRESTO_DEV_S3_CREDENTIAL_SOURCE:-auto}"
 DEV_GPU_S3_READER_MODE="${PRESTO_DEV_GPU_S3_READER_MODE:-kvikio}"
+DEV_S3_ADAPTIVE_TCP_MSS="${PRESTO_DEV_S3_ADAPTIVE_TCP_MSS:-auto}"
 DEV_ARGS=()
 
 print_dev_help() {
@@ -94,6 +95,12 @@ DEV_OPTIONS:
         long-lived environment credentials, uses refreshable EC2 instance-role
         credentials when none are set, and rejects ambiguous temporary credentials.
         Can also be set with PRESTO_DEV_S3_CREDENTIAL_SOURCE.
+    --s3-adaptive-tcp-mss auto|on|off
+        Control adaptive reuse of jumbo-capable AWS SDK curl connections.
+        Auto (default) enables it for buffered and buffered-cache readers, but
+        not KvikIO, which has a separate curl pool. On requires a buffered
+        direct-receive reader; off provides an explicit control experiment.
+        Can also be set with PRESTO_DEV_S3_ADAPTIVE_TCP_MSS.
 
 START_OPTIONS:
     Accepts the same GPU options as start_native_gpu_presto.sh, including:
@@ -258,6 +265,10 @@ while [[ $# -gt 0 ]]; do
       DEV_S3_CREDENTIAL_SOURCE=${2:?Error: --s3-credential-source requires a value}
       shift 2
       ;;
+    --s3-adaptive-tcp-mss)
+      DEV_S3_ADAPTIVE_TCP_MSS=${2:?Error: --s3-adaptive-tcp-mss requires a value}
+      shift 2
+      ;;
     *)
       DEV_ARGS+=("$1")
       shift
@@ -286,8 +297,20 @@ source "${SCRIPT_DIR}/s3_direct_receive_dev.sh"
 if ! DEV_GPU_S3_READER_MODE="$(normalize_gpu_s3_reader_mode "${DEV_GPU_S3_READER_MODE}")"; then
   exit 1
 fi
+if ! DEV_S3_ADAPTIVE_TCP_MSS="$(
+  normalize_s3_adaptive_tcp_mss_mode "${DEV_S3_ADAPTIVE_TCP_MSS}"
+)"; then
+  exit 1
+fi
 if [[ ${DEV_S3_DIRECT_RECEIVE} != true && ${DEV_GPU_S3_READER_MODE} != kvikio ]]; then
   echo "ERROR: buffered GPU S3 reader modes require --s3-direct-receive." >&2
+  exit 1
+fi
+if ! S3_ADAPTIVE_TCP_MSS_ENABLED="$(
+  resolve_s3_adaptive_tcp_mss_enabled \
+    gpu "${DEV_S3_DIRECT_RECEIVE}" "${DEV_GPU_S3_READER_MODE}" \
+    "${DEV_S3_ADAPTIVE_TCP_MSS}"
+)"; then
   exit 1
 fi
 
@@ -1249,7 +1272,8 @@ apply_s3_direct_receive_worker_catalogs \
   gpu "${DEV_S3_DIRECT_RECEIVE}" \
   "${SCRIPT_DIR}/../docker/config/generated/gpu" \
   "${SCRIPT_DIR}/../docker/config/template/etc_worker/catalog/hive.properties" \
-  "${DEV_GPU_S3_READER_MODE}"
+  "${DEV_GPU_S3_READER_MODE}" \
+  "${DEV_S3_ADAPTIVE_TCP_MSS}"
 GPU_HOST_RAM_GB=$(lsmem -b | awk '/Total online memory/ { print int($4 / (1024*1024*1024)); exit }')
 apply_gpu_worker_memory_and_cache_config \
   "${DEV_GPU_S3_READER_MODE}" \
@@ -1302,7 +1326,7 @@ if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
     "${S3_DIRECT_CREDENTIAL_SOURCE}" \
     "${S3_DIRECT_WORKER_SERVICES[@]}"
   COMPOSE_FILE_ARGS+=(-f "$S3_DIRECT_OVERRIDE_PATH")
-  echo "S3 direct receive enabled for GPU workers (${DEPS_IMAGE}); reader=${DEV_GPU_S3_READER_MODE}"
+  echo "S3 direct receive enabled for GPU workers (${DEPS_IMAGE}); reader=${DEV_GPU_S3_READER_MODE}; adaptive-tcp-mss=${DEV_S3_ADAPTIVE_TCP_MSS}/${S3_ADAPTIVE_TCP_MSS_ENABLED}"
   if [[ ${DEV_GPU_S3_READER_MODE} == kvikio ]]; then
     printf 'KvikIO S3 tuning: backend=%s direct-receive=%s task-size=%s max-concurrent-requests=%s reactors=%s dispatch=%s\n' \
       "${KVIKIO_REMOTE_IO_BACKEND}" \
