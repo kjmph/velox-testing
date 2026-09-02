@@ -75,6 +75,22 @@ assert_gpu_launcher_rejects_cuda_version() {
     "${error_file}"
 }
 
+assert_launcher_rejects_aws_direct_receive_mode() {
+  local launcher=$1
+  local expected_message=$2
+  shift 2
+  local launcher_name
+  local error_file
+  launcher_name=$(basename "${launcher}")
+  error_file="${TEST_ROOT}/${launcher_name}.aws-direct-receive-mode-error.txt"
+
+  if "${launcher}" "$@" --restart-target none \
+    > /dev/null 2> "${error_file}"; then
+    fail "${launcher_name} accepted an invalid AWS direct-receive mode configuration"
+  fi
+  assert_contains "${expected_message}" "${error_file}"
+}
+
 assert_occurs_before() {
   local first=$1
   local second=$2
@@ -132,6 +148,17 @@ unset KVIKIO_REMOTE_IO_BACKEND \
   KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS \
   KVIKIO_REMOTE_IO_NUM_REACTORS \
   KVIKIO_REMOTE_IO_REACTOR_DISPATCH
+
+for mode in caller-buffer preferred required; do
+  [[ $(normalize_s3_aws_direct_receive_mode "${mode^^}") == "${mode}" ]] ||
+    fail "S3 AWS direct-receive mode '${mode}' was not normalized"
+done
+if normalize_s3_aws_direct_receive_mode invalid >/dev/null 2>&1; then
+  fail 'invalid S3 AWS direct-receive mode was accepted'
+fi
+if normalize_s3_aws_direct_receive_mode disabled >/dev/null 2>&1; then
+  fail 'disabled was accepted as an enabled S3 AWS direct-receive mode'
+fi
 
 for mode in auto on off; do
   [[ $(normalize_s3_adaptive_tcp_mss_mode "${mode^^}") == "${mode}" ]] ||
@@ -375,13 +402,21 @@ done
 
 apply_s3_direct_receive_worker_catalogs cpu true "${CONFIG_ROOT}" "${BASELINE}"
 for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
-  [[ $(grep -c '^hive.s3.direct-receive-mode=caller-buffer$' "${file}") -eq 1 ]] ||
-    fail "CPU direct mode was not reconciled exactly once in ${file}"
-  [[ $(grep -c '^hive.s3.adaptive-tcp-mss-enabled=true$' "${file}") -eq 1 ]] ||
-    fail "CPU adaptive TCP MSS mode was not reconciled exactly once in ${file}"
+  [[ $(grep -c '^hive.s3.direct-receive-mode=required$' "${file}") -eq 1 ]] ||
+    fail "CPU strict kTLS default was not reconciled exactly once in ${file}"
+done
+for direct_mode in caller-buffer preferred required; do
+  apply_s3_direct_receive_worker_catalogs \
+    cpu true "${CONFIG_ROOT}" "${BASELINE}" buffered auto "${direct_mode}"
+  for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
+    [[ $(grep -c "^hive.s3.direct-receive-mode=${direct_mode}$" "${file}") -eq 1 ]] ||
+      fail "CPU ${direct_mode} mode was not reconciled exactly once in ${file}"
+    [[ $(grep -c '^hive.s3.adaptive-tcp-mss-enabled=true$' "${file}") -eq 1 ]] ||
+      fail "CPU adaptive TCP MSS mode was not reconciled exactly once in ${file}"
+  done
 done
 apply_s3_direct_receive_worker_catalogs \
-  cpu true "${CONFIG_ROOT}" "${BASELINE}" buffered off
+  cpu true "${CONFIG_ROOT}" "${BASELINE}" buffered off caller-buffer
 for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   assert_contains 'hive.s3.direct-receive-mode=caller-buffer' "${file}"
   assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
@@ -407,24 +442,35 @@ for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
 done
 
-for mode in buffered buffered-cache; do
-  apply_s3_direct_receive_worker_catalogs \
-    gpu true "${CONFIG_ROOT}" "${BASELINE}" "${mode}"
-  for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
-    [[ $(grep -c '^cudf.hive.use-buffered-input=true$' "${file}") -eq 1 ]] ||
-      fail "GPU ${mode} mode did not enable buffered input exactly once in ${file}"
-    [[ $(grep -c '^hive.s3.direct-receive-mode=caller-buffer$' "${file}") -eq 1 ]] ||
-      fail "GPU ${mode} mode did not enable caller-buffer receive exactly once in ${file}"
-    [[ $(grep -c '^hive.s3.adaptive-tcp-mss-enabled=true$' "${file}") -eq 1 ]] ||
-      fail "GPU ${mode} mode did not enable adaptive TCP MSS exactly once in ${file}"
+apply_s3_direct_receive_worker_catalogs \
+  gpu true "${CONFIG_ROOT}" "${BASELINE}" buffered-cache
+for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
+  assert_contains 'cudf.hive.use-buffered-input=true' "${file}"
+  [[ $(grep -c '^hive.s3.direct-receive-mode=required$' "${file}") -eq 1 ]] ||
+    fail "GPU buffered-cache did not default to strict kTLS exactly once in ${file}"
+done
+
+for reader_mode in buffered buffered-cache; do
+  for direct_mode in caller-buffer preferred required; do
+    apply_s3_direct_receive_worker_catalogs \
+      gpu true "${CONFIG_ROOT}" "${BASELINE}" \
+      "${reader_mode}" auto "${direct_mode}"
+    for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
+      [[ $(grep -c '^cudf.hive.use-buffered-input=true$' "${file}") -eq 1 ]] ||
+        fail "GPU ${reader_mode} mode did not enable buffered input exactly once in ${file}"
+      [[ $(grep -c "^hive.s3.direct-receive-mode=${direct_mode}$" "${file}") -eq 1 ]] ||
+        fail "GPU ${reader_mode}/${direct_mode} was not reconciled exactly once in ${file}"
+      [[ $(grep -c '^hive.s3.adaptive-tcp-mss-enabled=true$' "${file}") -eq 1 ]] ||
+        fail "GPU ${reader_mode} mode did not enable adaptive TCP MSS exactly once in ${file}"
+    done
   done
 done
 
 apply_s3_direct_receive_worker_catalogs \
-  gpu true "${CONFIG_ROOT}" "${BASELINE}" buffered off
+  gpu true "${CONFIG_ROOT}" "${BASELINE}" buffered off preferred
 for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   assert_contains 'cudf.hive.use-buffered-input=true' "${file}"
-  assert_contains 'hive.s3.direct-receive-mode=caller-buffer' "${file}"
+  assert_contains 'hive.s3.direct-receive-mode=preferred' "${file}"
   assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
 done
 if apply_s3_direct_receive_worker_catalogs \
@@ -435,6 +481,14 @@ fi
 if apply_s3_direct_receive_worker_catalogs \
   gpu true "${CONFIG_ROOT}" "${BASELINE}" invalid-mode 2>/dev/null; then
   fail 'invalid GPU S3 reader mode was accepted by catalog reconciliation'
+fi
+if apply_s3_direct_receive_worker_catalogs \
+  gpu true "${CONFIG_ROOT}" "${BASELINE}" buffered auto invalid-mode 2>/dev/null; then
+  fail 'invalid S3 AWS direct-receive mode was accepted by catalog reconciliation'
+fi
+if apply_s3_direct_receive_worker_catalogs \
+  cpu true "${CONFIG_ROOT}" "${BASELINE}" buffered auto invalid-mode 2>/dev/null; then
+  fail 'invalid CPU S3 AWS direct-receive mode was accepted by catalog reconciliation'
 fi
 
 apply_s3_direct_receive_worker_catalogs gpu false "${CONFIG_ROOT}" "${BASELINE}"
@@ -659,6 +713,9 @@ COMMON_COMPOSE="${SCRIPT_DIR}/../docker/docker-compose.common.yml"
 for launcher in "${CPU_LAUNCHER}" "${GPU_LAUNCHER}"; do
   assert_contains '--s3-direct-receive' "${launcher}"
   assert_contains 'PRESTO_DEV_S3_DIRECT_RECEIVE' "${launcher}"
+  assert_contains '--s3-aws-direct-receive-mode' "${launcher}"
+  assert_contains 'PRESTO_DEV_S3_AWS_DIRECT_RECEIVE_MODE' "${launcher}"
+  assert_contains 'normalize_s3_aws_direct_receive_mode' "${launcher}"
   assert_contains '--s3-credential-source' "${launcher}"
   assert_contains 'PRESTO_DEV_S3_CREDENTIAL_SOURCE' "${launcher}"
   assert_contains '--s3-adaptive-tcp-mss' "${launcher}"
@@ -694,6 +751,18 @@ assert_contains 'PRESTO_DEV_CUDA_VERSION' "${GPU_LAUNCHER}"
 assert_contains '--cuda-version "$DEV_CUDA_VERSION"' "${GPU_LAUNCHER}"
 assert_gpu_launcher_rejects_cuda_version
 assert_gpu_launcher_rejects_cuda_deps_override
+assert_launcher_rejects_aws_direct_receive_mode \
+  "${CPU_LAUNCHER}" \
+  'S3 AWS direct-receive mode must be caller-buffer, preferred, or required' \
+  --s3-aws-direct-receive-mode invalid
+assert_launcher_rejects_aws_direct_receive_mode \
+  "${GPU_LAUNCHER}" \
+  'S3 AWS direct-receive mode must be caller-buffer, preferred, or required' \
+  --s3-reader-mode buffered-cache --s3-aws-direct-receive-mode invalid
+assert_launcher_rejects_aws_direct_receive_mode \
+  "${GPU_LAUNCHER}" \
+  'S3 AWS direct-receive mode applies only to --s3-reader-mode buffered or buffered-cache' \
+  --s3-aws-direct-receive-mode required
 # Existing versioned worker images must remain reusable without an explicit
 # worker build target.
 # shellcheck disable=SC2016

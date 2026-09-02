@@ -59,6 +59,20 @@ function normalize_gpu_s3_reader_mode() {
   esac
 }
 
+function normalize_s3_aws_direct_receive_mode() {
+  local mode=${1,,}
+
+  case ${mode} in
+    caller-buffer|preferred|required)
+      printf '%s\n' "${mode}"
+      ;;
+    *)
+      echo "ERROR: S3 AWS direct-receive mode must be caller-buffer, preferred, or required; got '${1}'." >&2
+      return 1
+      ;;
+  esac
+}
+
 function normalize_s3_adaptive_tcp_mss_mode() {
   local mode=${1,,}
 
@@ -364,12 +378,18 @@ function apply_s3_direct_receive_worker_catalogs() {
   local baseline_worker_catalog=${4:-}
   local gpu_reader_mode=${5:-kvikio}
   local adaptive_tcp_mss_mode=${6:-auto}
+  local direct_receive_mode=${7:-required}
   local adaptive_tcp_mss_enabled
   local hive_config
   local baseline_buffered_input=''
 
   if [[ ${variant} == gpu && ${enabled} == true ]]; then
     gpu_reader_mode=$(normalize_gpu_s3_reader_mode "${gpu_reader_mode}") || return 1
+  fi
+  if [[ ${enabled} == true ]]; then
+    direct_receive_mode=$(
+      normalize_s3_aws_direct_receive_mode "${direct_receive_mode}"
+    ) || return 1
   fi
   adaptive_tcp_mss_enabled=$(
     resolve_s3_adaptive_tcp_mss_enabled \
@@ -398,17 +418,19 @@ function apply_s3_direct_receive_worker_catalogs() {
     fi
     if [[ ${enabled} == true && ${variant} == cpu ]]; then
       set_properties_file_value_exact \
-        "hive.s3.direct-receive-mode" "caller-buffer" "${hive_config}"
+        "hive.s3.direct-receive-mode" "${direct_receive_mode}" "${hive_config}"
     fi
     if [[ ${enabled} == true && ${variant} == gpu && ${gpu_reader_mode} == kvikio ]]; then
       set_properties_file_value_exact \
         "cudf.hive.use-buffered-input" "false" "${hive_config}"
     elif [[ ${enabled} == true && ${variant} == gpu ]]; then
-      # Buffered cuDF reads use Velox's S3 filesystem. Keep the same patched
-      # dependency chain as the KvikIO arm and receive directly into the
-      # caller-owned host buffer, which may be an AsyncDataCache entry.
+      # Buffered cuDF reads use Velox's S3 filesystem and AWS SDK/libcurl,
+      # rather than KvikIO, to fill caller-owned host buffers. In cache mode
+      # these destinations may be AsyncDataCache entries. Keep strict RX kTLS
+      # policy explicit so a benchmark cannot silently become a user-space TLS
+      # run; preferred and caller-buffer remain deliberate control modes.
       set_properties_file_value_exact \
-        "hive.s3.direct-receive-mode" "caller-buffer" "${hive_config}"
+        "hive.s3.direct-receive-mode" "${direct_receive_mode}" "${hive_config}"
       set_properties_file_value_exact \
         "cudf.hive.use-buffered-input" "true" "${hive_config}"
     elif [[ ${variant} == gpu && -n ${baseline_buffered_input} ]]; then
