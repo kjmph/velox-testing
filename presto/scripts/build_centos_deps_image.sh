@@ -15,6 +15,7 @@ NO_CACHE_ARG=''
 S3_DIRECT_RECEIVE=false
 UCX_SOURCE=''
 UCX_SOURCE_HASH=''
+REQUESTED_CUDA_VERSION="${PRESTO_DEV_CUDA_VERSION:-}"
 PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
 VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 
@@ -42,6 +43,9 @@ OPTIONS:
     --velox-source PATH  Velox source tree providing dependency setup scripts
                          and CMake modules (default: ../velox)
     --ucx-source PATH    Local UCX source tree to build into the dependency image
+    --cuda-version X.Y   CUDA toolkit major.minor version to install in an
+                         ordinary dependency image (for example, 13.2). Direct
+                         mode inherits CUDA from --base-image instead.
     --s3-direct-receive  Derive an isolated S3 direct-receive dependency image
                          from an existing CentOS dependency image. This does
                          not rebuild or retag the base image.
@@ -53,6 +57,8 @@ Environment:
                          Same as --presto-source.
     PRESTO_DEV_VELOX_SOURCE
                          Same as --velox-source.
+    PRESTO_DEV_CUDA_VERSION
+                         Same as --cuda-version.
 
 EOF
 }
@@ -105,6 +111,15 @@ parse_args() {
           exit 1
         fi
         ;;
+      --cuda-version)
+        if [[ -n $2 ]]; then
+          REQUESTED_CUDA_VERSION=$2
+          shift 2
+        else
+          echo "Error: --cuda-version requires a value"
+          exit 1
+        fi
+        ;;
       --s3-direct-receive)
         S3_DIRECT_RECEIVE=true
         shift
@@ -128,6 +143,11 @@ parse_args() {
 }
 
 parse_args "$@"
+
+if [[ -n ${REQUESTED_CUDA_VERSION} && ! ${REQUESTED_CUDA_VERSION} =~ ^[0-9]+\.[0-9]+$ ]]; then
+  echo "Error: --cuda-version must be a major.minor version such as 13.2" >&2
+  exit 1
+fi
 
 function derive_s3_direct_image_name {
   local base_image=$1
@@ -165,7 +185,42 @@ function normalize_image_reference_for_compare {
   printf '%s\n' "${image_reference}"
 }
 
+function verify_cuda_toolkit_image {
+  local image=$1
+  local requested_version=$2
+  local image_info
+  local image_cuda_version
+  local nvcc_cuda_version
+
+  if ! image_info=$(docker run --rm --entrypoint /bin/bash "${image}" -c '
+    set -euo pipefail
+    nvcc_release=$(nvcc --version |
+      sed -n "s/.*release \([0-9][0-9.]*\),.*/\1/p")
+    test -n "${nvcc_release}"
+    nvcc --list-gpu-arch >/dev/null
+    printf "%s\n%s\n" "${CUDA_VERSION:-}" "${nvcc_release}"
+  '); then
+    echo "Error: unable to validate CUDA toolkit ${requested_version} in ${image}" >&2
+    return 1
+  fi
+
+  image_cuda_version=$(sed -n '1p' <<< "${image_info}")
+  nvcc_cuda_version=$(sed -n '2p' <<< "${image_info}")
+  if [[ ${image_cuda_version} != "${requested_version}" ||
+        ${nvcc_cuda_version} != "${requested_version}" ]]; then
+    echo "Error: CUDA toolkit validation failed for ${image}" >&2
+    echo "Expected ${requested_version}; image reports CUDA_VERSION=${image_cuda_version:-<unset>}, nvcc=${nvcc_cuda_version:-<unknown>}." >&2
+    return 1
+  fi
+  echo "Validated CUDA toolkit ${requested_version} in ${image}"
+}
+
 if ${S3_DIRECT_RECEIVE}; then
+  if [[ -n ${REQUESTED_CUDA_VERSION} ]]; then
+    echo "Error: --cuda-version cannot be combined with --s3-direct-receive" >&2
+    echo "Build the ordinary base with --cuda-version first, then extend it with --base-image." >&2
+    exit 1
+  fi
   BASE_IMAGE=${BASE_IMAGE:-${DEFAULT_IMAGE_NAME}}
   if ! ${IMAGE_NAME_SET}; then
     IMAGE_NAME=$(derive_s3_direct_image_name "${BASE_IMAGE}")
@@ -188,6 +243,8 @@ if ${S3_DIRECT_RECEIVE}; then
 elif [[ -n ${BASE_IMAGE} ]]; then
   echo "Error: --base-image requires --s3-direct-receive"
   exit 1
+elif [[ -n ${REQUESTED_CUDA_VERSION} ]] && ! ${IMAGE_NAME_SET}; then
+  IMAGE_NAME="${DEFAULT_IMAGE_NAME}-cuda${REQUESTED_CUDA_VERSION}"
 fi
 
 # Compute the directory where this script resides
@@ -398,6 +455,13 @@ cp -r "${VELOX_SOURCE}/scripts" velox
 cp -r "${VELOX_SOURCE}/CMake" velox
 
 BUILD_ARGS=()
+if [[ -n ${REQUESTED_CUDA_VERSION} ]]; then
+  echo "Installing CUDA toolkit ${REQUESTED_CUDA_VERSION} in the ordinary dependency image"
+  BUILD_ARGS+=(--build-arg "CUDA_VERSION=${REQUESTED_CUDA_VERSION}")
+  # The Compose path forwards this explicitly. Preserve the same portable ARM
+  # policy when the versioned CUDA path invokes docker build directly.
+  BUILD_ARGS+=(--build-arg "ARM_BUILD_TARGET=${ARM_BUILD_TARGET:-}")
+fi
 if [[ -n "${UCX_SOURCE}" ]]; then
   UCX_SOURCE_HASH="$(compute_ucx_source_hash)"
   echo "Using UCX_LOCAL_SOURCE_HASH=${UCX_SOURCE_HASH}"
@@ -438,12 +502,27 @@ if ${S3_DIRECT_RECEIVE}; then
     --tag "${IMAGE_NAME}" \
     "${PRESTO_NATIVE_DIR}"
 else
-  docker compose --progress plain build ${NO_CACHE_ARG} "${BUILD_ARGS[@]}" centos-native-dependency
+  if [[ -n ${REQUESTED_CUDA_VERSION} ]]; then
+    # Build an opt-in toolkit directly to its requested tag. The Compose
+    # service names the shared canonical image, so using it here would silently
+    # replace the ordinary toolkit image even when IMAGE_NAME is versioned.
+    ORDINARY_BUILD_ARGS=(--progress plain)
+    [[ -n ${NO_CACHE_ARG} ]] && ORDINARY_BUILD_ARGS+=("${NO_CACHE_ARG}")
+    ORDINARY_BUILD_ARGS+=(
+      "${BUILD_ARGS[@]}"
+      --file scripts/dockerfiles/centos-dependency.dockerfile
+      --tag "${IMAGE_NAME}"
+    )
+    docker build "${ORDINARY_BUILD_ARGS[@]}" .
+    verify_cuda_toolkit_image "${IMAGE_NAME}" "${REQUESTED_CUDA_VERSION}"
+  else
+    docker compose --progress plain build ${NO_CACHE_ARG} "${BUILD_ARGS[@]}" centos-native-dependency
 
-  # tag with the user-specific name to avoid conflicts between multiple users on the same host
-  if [[ "${IMAGE_NAME}" != "${COMPOSE_IMAGE_NAME}" ]]; then
-    echo "Tagging image as ${IMAGE_NAME}..."
-    docker tag "${COMPOSE_IMAGE_NAME}" "${IMAGE_NAME}"
+    # tag with the user-specific name to avoid conflicts between multiple users on the host
+    if [[ "${IMAGE_NAME}" != "${COMPOSE_IMAGE_NAME}" ]]; then
+      echo "Tagging image as ${IMAGE_NAME}..."
+      docker tag "${COMPOSE_IMAGE_NAME}" "${IMAGE_NAME}"
+    fi
   fi
 fi
 

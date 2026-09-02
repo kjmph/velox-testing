@@ -577,5 +577,9 @@ function ensure_s3_direct_dependency_image() {
     --velox-source "${velox_source}"
   )
   [[ ${no_cache} == true ]] && args+=(--no-cache)
-  "${SCRIPT_DIR}/build_centos_deps_image.sh" "${args[@]}"
+  # CUDA selection applies only while building the ordinary dependency image.
+  # The derived direct-receive image inherits that toolkit from its immutable
+  # base, so do not leak a launcher's environment default into this stage.
+  PRESTO_DEV_CUDA_VERSION='' \
+    "${SCRIPT_DIR}/build_centos_deps_image.sh" "${args[@]}"
 }

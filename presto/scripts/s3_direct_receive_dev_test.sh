@@ -52,6 +52,29 @@ assert_gpu_launcher_rejects_ucx_environment() {
   assert_contains "${expected_message}" "${error_file}"
 }
 
+assert_gpu_launcher_rejects_cuda_deps_override() {
+  local error_file="${TEST_ROOT}/gpu-cuda-deps-override-error.txt"
+
+  if DEPS_IMAGE=test.example/presto-deps:ordinary \
+    "${GPU_LAUNCHER}" --cuda-version 13.2 --restart-target none \
+    > /dev/null 2> "${error_file}"; then
+    fail 'GPU launcher accepted DEPS_IMAGE together with --cuda-version'
+  fi
+  assert_contains 'DEPS_IMAGE cannot be combined with --cuda-version' "${error_file}"
+}
+
+assert_gpu_launcher_rejects_cuda_version() {
+  local error_file="${TEST_ROOT}/gpu-cuda-version-error.txt"
+
+  if "${GPU_LAUNCHER}" --cuda-version latest --restart-target none \
+    > /dev/null 2> "${error_file}"; then
+    fail 'GPU launcher accepted an invalid CUDA toolkit version'
+  fi
+  assert_contains \
+    '--cuda-version must be a major.minor version such as 13.2' \
+    "${error_file}"
+}
+
 assert_occurs_before() {
   local first=$1
   local second=$2
@@ -197,7 +220,8 @@ mkdir -p "${MOCK_SCRIPT_DIR}"
 # shellcheck disable=SC2016
 printf '%s\n' \
   '#!/usr/bin/env bash' \
-  'printf "%s\\n" "$@" > "${MOCK_BUILD_LOG}"' \
+  'printf "PRESTO_DEV_CUDA_VERSION=%s\\n" "${PRESTO_DEV_CUDA_VERSION:-}" > "${MOCK_BUILD_LOG}"' \
+  'printf "%s\\n" "$@" >> "${MOCK_BUILD_LOG}"' \
   'exit "${MOCK_BUILD_EXIT:-0}"' \
   > "${MOCK_SCRIPT_DIR}/build_centos_deps_image.sh"
 chmod +x "${MOCK_SCRIPT_DIR}/build_centos_deps_image.sh"
@@ -221,8 +245,10 @@ fi
 
 # Every worker build revalidates provenance through the derived builder.
 MOCK_BASE_MISSING=false
-ensure_s3_direct_dependency_image \
+PRESTO_DEV_CUDA_VERSION=13.2 ensure_s3_direct_dependency_image \
   direct-image ordinary-image /src/presto /src/velox true
+assert_contains 'PRESTO_DEV_CUDA_VERSION=' "${MOCK_BUILD_LOG}"
+assert_not_contains 'PRESTO_DEV_CUDA_VERSION=13.2' "${MOCK_BUILD_LOG}"
 for argument in \
   --s3-direct-receive \
   ordinary-image \
@@ -652,11 +678,28 @@ done
 # shellcheck disable=SC2016
 assert_contains 'CPU_WORKER_IMAGE="${CPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"' "${CPU_LAUNCHER}"
 # shellcheck disable=SC2016
-assert_contains 'GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"' "${GPU_LAUNCHER}"
+assert_contains 'GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}${PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX}-s3-direct"' "${GPU_LAUNCHER}"
+# shellcheck disable=SC2016
+assert_contains 'PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX="-cuda${DEV_CUDA_VERSION}"' "${GPU_LAUNCHER}"
+# shellcheck disable=SC2016
+assert_contains '${PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX:-}' "${GPU_COMPOSE_TEMPLATE}"
 assert_contains 'apply_s3_direct_receive_kvikio_defaults' "${GPU_LAUNCHER}"
 assert_not_contains 'apply_s3_direct_receive_kvikio_defaults' "${CPU_LAUNCHER}"
 assert_contains '--s3-reader-mode' "${GPU_LAUNCHER}"
 assert_contains 'PRESTO_DEV_GPU_S3_READER_MODE' "${GPU_LAUNCHER}"
+assert_contains '--cuda-version' "${GPU_LAUNCHER}"
+assert_contains 'PRESTO_DEV_CUDA_VERSION' "${GPU_LAUNCHER}"
+# This assertion intentionally matches a literal shell variable.
+# shellcheck disable=SC2016
+assert_contains '--cuda-version "$DEV_CUDA_VERSION"' "${GPU_LAUNCHER}"
+assert_gpu_launcher_rejects_cuda_version
+assert_gpu_launcher_rejects_cuda_deps_override
+# Existing versioned worker images must remain reusable without an explicit
+# worker build target.
+# shellcheck disable=SC2016
+assert_contains 'conditionally_add_build_target "$GPU_WORKER_IMAGE"' "${GPU_LAUNCHER}"
+# shellcheck disable=SC2016
+assert_not_contains '! build_targets_include_gpu_worker' "${GPU_LAUNCHER}"
 assert_contains 'apply_gpu_worker_memory_and_cache_config' "${GPU_LAUNCHER}"
 assert_contains 'apply_gpu_s3_coordinator_config' "${GPU_LAUNCHER}"
 assert_contains 'reconcile_gpu_s3_coordinator_restart_target' "${GPU_LAUNCHER}"

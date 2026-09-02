@@ -17,6 +17,7 @@ DEV_PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
 DEV_UCX_SOURCE="${PRESTO_DEV_UCX_SOURCE:-}"
 DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 DEV_CUDF_SOURCE="${PRESTO_DEV_CUDF_SOURCE:-}"
+DEV_CUDA_VERSION="${PRESTO_DEV_CUDA_VERSION:-}"
 DEV_S3_DIRECT_RECEIVE="${PRESTO_DEV_S3_DIRECT_RECEIVE:-false}"
 DEV_S3_CREDENTIAL_SOURCE="${PRESTO_DEV_S3_CREDENTIAL_SOURCE:-auto}"
 DEV_GPU_S3_READER_MODE="${PRESTO_DEV_GPU_S3_READER_MODE:-kvikio}"
@@ -70,6 +71,12 @@ DEV_OPTIONS:
         Build native GPU workers from this cuDF source tree instead of the
         commit fetched by Velox. The path must be inside the Docker build
         context root. Can also be set with PRESTO_DEV_CUDF_SOURCE.
+    --cuda-version X.Y
+        Build the dependency and GPU worker images with this CUDA toolkit
+        major.minor version, for example 13.2. The default remains the CUDA
+        version selected by the dependency source. A versioned per-user
+        dependency image keeps this opt-in separate from the ordinary image.
+        Can also be set with PRESTO_DEV_CUDA_VERSION.
     --s3-direct-receive
         Build and run GPU workers with the isolated S3 direct-receive
         dependency chain. The default reader mode is strict KvikIO direct
@@ -252,6 +259,10 @@ while [[ $# -gt 0 ]]; do
       DEV_CUDF_SOURCE=${2:?Error: --cudf-source requires a value}
       shift 2
       ;;
+    --cuda-version)
+      DEV_CUDA_VERSION=${2:?Error: --cuda-version requires a value}
+      shift 2
+      ;;
     --s3-direct-receive)
       DEV_S3_DIRECT_RECEIVE=true
       shift
@@ -286,6 +297,10 @@ if ! DEV_PRESTO_DEPENDENCIES="$(normalize_dev_bool "$DEV_PRESTO_DEPENDENCIES" "P
   exit 1
 fi
 if ! DEV_S3_DIRECT_RECEIVE="$(normalize_dev_bool "$DEV_S3_DIRECT_RECEIVE" "PRESTO_DEV_S3_DIRECT_RECEIVE")"; then
+  exit 1
+fi
+if [[ -n ${DEV_CUDA_VERSION} && ! ${DEV_CUDA_VERSION} =~ ^[0-9]+\.[0-9]+$ ]]; then
+  echo "ERROR: --cuda-version must be a major.minor version such as 13.2." >&2
   exit 1
 fi
 if ! configure_dev_gpu_ucx_environment; then
@@ -429,12 +444,29 @@ export PRESTO_DEV_NETWORK_NAME
 COORDINATOR_SERVICE="presto-coordinator"
 COORDINATOR_IMAGE="${COORDINATOR_SERVICE}:${PRESTO_IMAGE_TAG}"
 GPU_WORKER_SERVICE="presto-native-worker-gpu"
-ORDINARY_DEPS_IMAGE="${DEPS_IMAGE:-presto/prestissimo-dependency:centos9-${USER:-latest}}"
+CONFIGURED_DEPS_IMAGE="${DEPS_IMAGE:-}"
+if [[ -n ${CONFIGURED_DEPS_IMAGE} && -n ${DEV_CUDA_VERSION} ]]; then
+  echo "ERROR: DEPS_IMAGE cannot be combined with --cuda-version." >&2
+  echo "Unset DEPS_IMAGE so the launcher can create an isolated CUDA ${DEV_CUDA_VERSION} dependency image." >&2
+  exit 1
+fi
+if [[ -n ${CONFIGURED_DEPS_IMAGE} ]]; then
+  ORDINARY_DEPS_IMAGE="${CONFIGURED_DEPS_IMAGE}"
+elif [[ -n ${DEV_CUDA_VERSION} ]]; then
+  ORDINARY_DEPS_IMAGE="presto/prestissimo-dependency:centos9-${USER:-latest}-cuda${DEV_CUDA_VERSION}"
+else
+  ORDINARY_DEPS_IMAGE="presto/prestissimo-dependency:centos9-${USER:-latest}"
+fi
 DEPS_IMAGE="${ORDINARY_DEPS_IMAGE}"
-GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}"
+PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX=''
+if [[ -n ${DEV_CUDA_VERSION} ]]; then
+  PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX="-cuda${DEV_CUDA_VERSION}"
+fi
+export PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX
+GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}${PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX}"
 if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
   DEPS_IMAGE="${S3_DIRECT_DEPS_IMAGE:-$(derive_s3_direct_dependency_image_name "${ORDINARY_DEPS_IMAGE}")}"
-  GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}-s3-direct"
+  GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}${PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX}-s3-direct"
   if [[ ${DEV_GPU_S3_READER_MODE} == kvikio ]]; then
     apply_s3_direct_receive_kvikio_defaults
   fi
@@ -1378,13 +1410,15 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
     fi
   fi
 
-  if build_targets_include_gpu_worker && [[ -n "$DEV_UCX_SOURCE" ]]; then
+  if build_targets_include_gpu_worker &&
+    [[ -n "$DEV_UCX_SOURCE" || -n "$DEV_CUDA_VERSION" ]]; then
     DEPS_BUILD_ARGS=(
       --image-name "$ORDINARY_DEPS_IMAGE"
       --presto-source "$(effective_presto_source)"
       --velox-source "$(effective_velox_source)"
-      --ucx-source "$DEV_UCX_SOURCE"
     )
+    [[ -n "$DEV_UCX_SOURCE" ]] && DEPS_BUILD_ARGS+=(--ucx-source "$DEV_UCX_SOURCE")
+    [[ -n "$DEV_CUDA_VERSION" ]] && DEPS_BUILD_ARGS+=(--cuda-version "$DEV_CUDA_VERSION")
     [[ -n "${SKIP_CACHE_ARG:-}" ]] && DEPS_BUILD_ARGS+=(--no-cache)
     "${SCRIPT_DIR}/build_centos_deps_image.sh" "${DEPS_BUILD_ARGS[@]}"
   fi

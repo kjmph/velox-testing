@@ -2,7 +2,9 @@ x-presto-native-worker-gpu: &gpu_worker_base
   extends:
     file: ../../docker-compose.common.yml
     service: presto-base-native-worker
-  image: presto-native-worker-gpu:${PRESTO_IMAGE_TAG:?PRESTO_IMAGE_TAG must be set}
+  # Keep opt-in toolkits isolated from the ordinary worker tag. The suffix is
+  # empty for standard launches and e.g. "-cuda13.2" for a versioned dev build.
+  image: presto-native-worker-gpu:${PRESTO_IMAGE_TAG:?PRESTO_IMAGE_TAG must be set}${PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX:-}
   build:
     args:
       - GPU=ON

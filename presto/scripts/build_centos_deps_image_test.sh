@@ -117,8 +117,19 @@ if [[ $1 == tag ]]; then
   exit 0
 fi
 
+if [[ $1 == run ]]; then
+  if [[ ${FAKE_DOCKER_FAIL_CUDA_VALIDATION:-0} == 1 ]]; then
+    exit 47
+  fi
+  printf '%s\n%s\n' \
+    "${FAKE_CUDA_ENV_VERSION:-13.2}" \
+    "${FAKE_NVCC_VERSION:-13.2}"
+  exit 0
+fi
+
 if [[ $1 == build ]]; then
   tag=''
+  dockerfile=''
   expected_installer_hash=''
   base_dependency_build_image=''
   context=${!#}
@@ -126,6 +137,9 @@ if [[ $1 == build ]]; then
     if [[ ${!index} == --tag ]]; then
       next=$((index + 1))
       tag=${!next}
+    elif [[ ${!index} == --file ]]; then
+      next=$((index + 1))
+      dockerfile=${!next}
     elif [[ ${!index} == --build-arg ]]; then
       next=$((index + 1))
       if [[ ${!next} == INSTALLER_SOURCE_SHA256=* ]]; then
@@ -136,6 +150,13 @@ if [[ $1 == build ]]; then
     fi
   done
   [[ -f ${context}/velox/scripts/selected-marker ]] || exit 43
+  if [[ ${dockerfile} == scripts/dockerfiles/centos-dependency.dockerfile ]]; then
+    if [[ ${FAKE_DOCKER_FAIL_BUILD:-0} == 1 ]]; then
+      exit 42
+    fi
+    printf 'sha256:ordinary-result\n' > "${FAKE_DOCKER_OUTPUT_ID_FILE}"
+    exit 0
+  fi
   actual_installer_hash=$(
     cd "${context}/velox"
     find scripts \( -type f -o -type l \) -print0 |
@@ -209,6 +230,109 @@ assert_contains \
   "${DOCKER_LOG}"
 assert_not_contains 'build --progress plain --build-arg' "${DOCKER_LOG}"
 assert_embedded_velox_restored
+
+# An explicit toolkit version is forwarded only to the ordinary dependency
+# build. The selected image remains user-namespaced by the caller.
+reset_fake_images
+"${BUILD_SCRIPT}" \
+  --presto-source "${PRESTO_SOURCE}" \
+  --velox-source "${VELOX_SOURCE}" \
+  --cuda-version 13.2 \
+  --image-name test.example/presto-deps:cuda13.2
+assert_contains \
+  'build --progress plain --build-arg CUDA_VERSION=13.2 --build-arg ARM_BUILD_TARGET= --file scripts/dockerfiles/centos-dependency.dockerfile --tag test.example/presto-deps:cuda13.2 .' \
+  "${DOCKER_LOG}"
+assert_not_contains 'compose ' "${DOCKER_LOG}"
+assert_not_contains \
+  'tag presto/prestissimo-dependency:centos9 test.example/presto-deps:cuda13.2' \
+  "${DOCKER_LOG}"
+[[ $(<"${CANONICAL_ID_FILE}") == "${CANONICAL_ID}" ]] ||
+  fail 'the versioned CUDA build changed the canonical dependency image'
+assert_embedded_velox_restored
+
+# Without an explicit output name, a CUDA build derives a versioned per-user
+# tag instead of replacing the ordinary dependency image.
+reset_fake_images
+USER=tester "${BUILD_SCRIPT}" \
+  --presto-source "${PRESTO_SOURCE}" \
+  --velox-source "${VELOX_SOURCE}" \
+  --cuda-version 13.2
+assert_contains \
+  '--tag presto/prestissimo-dependency:centos9-tester-cuda13.2' \
+  "${DOCKER_LOG}"
+assert_not_contains \
+  '--tag presto/prestissimo-dependency:centos9-tester .' \
+  "${DOCKER_LOG}"
+[[ $(<"${CANONICAL_ID_FILE}") == "${CANONICAL_ID}" ]] ||
+  fail 'the default versioned CUDA build changed the canonical dependency image'
+assert_embedded_velox_restored
+
+# The direct docker-build path preserves the same explicit ARM portability
+# override as the ordinary Compose build.
+reset_fake_images
+ARM_BUILD_TARGET=common "${BUILD_SCRIPT}" \
+  --presto-source "${PRESTO_SOURCE}" \
+  --velox-source "${VELOX_SOURCE}" \
+  --cuda-version 13.2 \
+  --image-name test.example/presto-deps:cuda13.2-arm
+assert_contains '--build-arg ARM_BUILD_TARGET=common' "${DOCKER_LOG}"
+assert_embedded_velox_restored
+
+# CUDA and local UCX selection share the isolated direct docker-build path.
+UCX_SOURCE="${TEST_ROOT}/ucx"
+mkdir -p "${UCX_SOURCE}"
+printf 'ucx-source\n' > "${UCX_SOURCE}/marker"
+printf '#!/bin/sh\n' > "${UCX_SOURCE}/autogen.sh"
+reset_fake_images
+"${BUILD_SCRIPT}" \
+  --presto-source "${PRESTO_SOURCE}" \
+  --velox-source "${VELOX_SOURCE}" \
+  --ucx-source "${UCX_SOURCE}" \
+  --cuda-version 13.2 \
+  --image-name test.example/presto-deps:cuda13.2-ucx
+assert_contains '--build-arg CUDA_VERSION=13.2' "${DOCKER_LOG}"
+assert_contains '--build-arg UCX_LOCAL_SOURCE=.local_ucx_source' "${DOCKER_LOG}"
+assert_contains '--tag test.example/presto-deps:cuda13.2-ucx' "${DOCKER_LOG}"
+[[ ! -e ${PRESTO_NATIVE_DIR}/.local_ucx_source ]] ||
+  fail 'the staged local UCX source was not removed'
+assert_embedded_velox_restored
+
+reset_fake_images
+if FAKE_NVCC_VERSION=12.9 "${BUILD_SCRIPT}" \
+  --presto-source "${PRESTO_SOURCE}" \
+  --velox-source "${VELOX_SOURCE}" \
+  --cuda-version 13.2 \
+  --image-name test.example/presto-deps:cuda-mismatch; then
+  fail 'a dependency image with the wrong nvcc version was accepted'
+fi
+assert_embedded_velox_restored
+
+if "${BUILD_SCRIPT}" \
+  --presto-source "${PRESTO_SOURCE}" \
+  --velox-source "${VELOX_SOURCE}" \
+  --cuda-version latest; then
+  fail 'an invalid CUDA toolkit version was accepted'
+fi
+
+if "${BUILD_SCRIPT}" \
+  --presto-source "${PRESTO_SOURCE}" \
+  --velox-source "${VELOX_SOURCE}" \
+  --cuda-version 13.2 \
+  --s3-direct-receive; then
+  fail 'direct mode accepted a CUDA version instead of inheriting its base toolkit'
+fi
+assert_embedded_velox_restored
+
+# The environment and command-line interfaces have the same direct-mode
+# contract: CUDA is selected while building the ordinary immutable base.
+if PRESTO_DEV_CUDA_VERSION=13.2 "${BUILD_SCRIPT}" \
+  --presto-source "${PRESTO_SOURCE}" \
+  --velox-source "${VELOX_SOURCE}" \
+  --s3-direct-receive \
+  --base-image "${BASE_IMAGE}" \
+  --image-name test.example/presto-deps:cuda13.2-s3-direct; then
+  fail 'direct mode accepted PRESTO_DEV_CUDA_VERSION instead of inheriting its base toolkit'
+fi
 
 # With no explicit base or output, direct mode extends the ordinary per-user
 # image and derives a distinct tag.
