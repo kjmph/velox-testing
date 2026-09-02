@@ -46,9 +46,23 @@ def pytest_addoption(parser):
     parser.addoption("--profile", action="store_true", default=False)
     parser.addoption("--profile-script-path")
     parser.addoption("--metrics", action="store_true", default=False)
+    parser.addoption(
+        "--cold",
+        action="store_true",
+        default=False,
+        help="Clear native workers' Velox memory cache once before each query's iterations.",
+    )
+    parser.addoption(
+        "--cold-every-iteration",
+        action="store_true",
+        default=False,
+        help="Clear native workers' Velox memory cache before every query iteration.",
+    )
     parser.addoption("--skip-drop-cache", action="store_true", default=False)
     parser.addoption("--skip-analyze-check", action="store_true", default=False)
 
 
 def pytest_configure(config):
+    if config.getoption("--cold") and config.getoption("--cold-every-iteration"):
+        raise pytest.UsageError("--cold and --cold-every-iteration are mutually exclusive")
     pytest.data_location = DataLocation("--schema-name", "Schema", BenchmarkKeys.SCHEMA_NAME_KEY)

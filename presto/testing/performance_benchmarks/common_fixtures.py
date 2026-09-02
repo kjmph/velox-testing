@@ -12,6 +12,7 @@ from common.testing.performance_benchmarks.benchmark_keys import BenchmarkKeys
 from common.testing.performance_benchmarks.profiler_utils import start_profiler, stop_profiler
 
 from ..integration_tests.analyze_tables import check_tables_analyzed
+from .cache_control import clear_worker_memory_caches
 from .metrics_collector import collect_metrics
 from .run_context import gather_run_context
 
@@ -53,6 +54,14 @@ def run_context_collector(request):
     session_properties = session_properties_from_config(request.config)
     if session_properties:
         ctx["session_properties"] = session_properties
+    cold = request.config.getoption("--cold")
+    cold_every_iteration = request.config.getoption("--cold-every-iteration")
+    if cold or cold_every_iteration:
+        if ctx.get("engine") == "presto-java":
+            pytest.exit(
+                "Cold cache modes require native Presto workers with the Velox cache-control API.", returncode=1
+            )
+        ctx["cache_mode"] = "memory-cold-every-iteration" if cold_every_iteration else "memory-cold-first-iteration"
     ctx["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     yield ctx
     request.session.run_context = ctx
@@ -103,6 +112,8 @@ def benchmark_query(request, presto_cursor, benchmark_queries, benchmark_result_
     profile = request.config.getoption("--profile")
     profile_script_path = request.config.getoption("--profile-script-path")
     metrics = request.config.getoption("--metrics")
+    cold = request.config.getoption("--cold")
+    cold_every_iteration = request.config.getoption("--cold-every-iteration")
     benchmark_type = request.node.obj.BENCHMARK_TYPE
     bench_output_dir = request.config.getoption("--output-dir")
     hostname = request.config.getoption("--hostname")
@@ -128,12 +139,24 @@ def benchmark_query(request, presto_cursor, benchmark_queries, benchmark_result_
     def benchmark_query_function(query_id):
         profile_output_file_path = None
         try:
+            if cold:
+                clear_result = clear_worker_memory_caches(hostname=hostname, port=port)
+                print(
+                    f"[Cache] {benchmark_type} {query_id}: cleared "
+                    f"{len(clear_result.worker_uris)} native-worker memory cache(s) before iteration 1/{iterations}."
+                )
             if profile:
                 # Base path without .nsys-rep extension: {dir}/{query_id}
                 profile_output_file_path = f"{profile_output_dir_path.absolute()}/{query_id}"
                 start_profiler(profile_script_path, profile_output_file_path)
             result = []
             for iteration_num in range(iterations):
+                if cold_every_iteration:
+                    clear_result = clear_worker_memory_caches(hostname=hostname, port=port)
+                    print(
+                        f"[Cache] {benchmark_type} {query_id} iteration {iteration_num + 1}/{iterations}: "
+                        f"cleared {len(clear_result.worker_uris)} native-worker memory cache(s)."
+                    )
                 cursor = presto_cursor.execute(
                     "--" + str(benchmark_type) + "_" + str(query_id) + "--" + "\n" + benchmark_queries[query_id]
                 )

@@ -184,6 +184,9 @@ A couple of utility scripts have been added to facilitate the process of setting
 
 ## Presto Benchmarking
 The Presto benchmarks are implemented using the [pytest](https://docs.pytest.org/en/stable/) framework and builds on top of infrastructure that was implemented for general Presto testing. Specifically, the `start_*` scripts mentioned in the "Presto Testing" section can be used to start up a Presto variant (make sure the `PRESTO_DATA_DIR` environment variable is set appropriately before running the script), and the benchmark can be run by executing the `run_benchmark.sh` script from within the `velox-testing/presto/scripts` directory. Execute `./run_benchmark.sh --help` to get more details about the benchmark script options.
+
+By default, cache contents carry across the query-major suite and results retain the existing Lukewarm/Hot reporting. Use `--cold` to clear every native worker's Velox in-memory `AsyncDataCache` once before each query's iteration group. The first iteration measures a cache-cold read, while the remaining iterations measure the cache it populated. Use `--cold-every-iteration` for repeated cache-cold samples. Both modes keep worker processes and connection pools warm and do not clear the optional SSD cache or host OS page cache. Cold-mode benchmarks require an otherwise idle cluster because cache entries used by concurrent queries remain pinned and cannot be cleared.
+
 > [!TIP]
 ANALYZE TABLES `velox-testing/presto/scripts/analyze_tables.sh` must be run on CPU Presto before GPU benchmarks because aggregation is not yet supported on GPU. Statistics are stored in the Hive metastore and automatically benefit GPU query execution, improving performance and reducing OOM failures.
 

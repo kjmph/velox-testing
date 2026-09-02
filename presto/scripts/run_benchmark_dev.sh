@@ -37,7 +37,11 @@ OPTIONS:
     -t, --tag               Output tag. Must contain only alphanumeric and underscore characters.
     --session-property      Presto session property as key=value. May be repeated.
     -p, --profile           Enable profiling of benchmark queries.
-    --skip-drop-cache       Skip dropping system caches before each benchmark query.
+    --cold                  Clear native workers' Velox memory cache once before each query.
+                            The first iteration is cold; later iterations warm and reuse the cache.
+    --cold-every-iteration  Clear native workers' Velox memory cache before every iteration.
+                            All iterations are cold. Neither mode clears SSD or OS page caches.
+    --skip-drop-cache       Skip dropping system caches once before the benchmark run.
     --skip-analyze-check    Skip checking that ANALYZE TABLE has been run on all tables.
     -m, --metrics           Collect detailed metrics from Presto REST API after each query.
     -v, --verbose           Print debug logs for worker/engine detection.
@@ -60,6 +64,8 @@ OUTPUT_DIR=""
 ITERATIONS=""
 TAG=""
 PROFILE=false
+COLD=false
+COLD_EVERY_ITERATION=false
 SKIP_DROP_CACHE=false
 SKIP_ANALYZE_CHECK=false
 METRICS=false
@@ -128,6 +134,14 @@ while [[ $# -gt 0 ]]; do
       PROFILE=true
       shift
       ;;
+    --cold)
+      COLD=true
+      shift
+      ;;
+    --cold-every-iteration)
+      COLD_EVERY_ITERATION=true
+      shift
+      ;;
     --skip-drop-cache)
       SKIP_DROP_CACHE=true
       shift
@@ -164,6 +178,11 @@ if [[ -z ${SCHEMA_NAME} ]]; then
   exit 1
 fi
 
+if [[ ${COLD} == "true" && ${COLD_EVERY_ITERATION} == "true" ]]; then
+  echo "Error: --cold and --cold-every-iteration are mutually exclusive." >&2
+  exit 1
+fi
+
 set_presto_coordinator_defaults
 
 PYTEST_ARGS=(--schema-name "$SCHEMA_NAME")
@@ -193,6 +212,8 @@ if [[ "${PROFILE}" == "true" ]]; then
 fi
 
 [[ "${METRICS}" == "true" ]] && PYTEST_ARGS+=(--metrics)
+[[ "${COLD}" == "true" ]] && PYTEST_ARGS+=(--cold)
+[[ "${COLD_EVERY_ITERATION}" == "true" ]] && PYTEST_ARGS+=(--cold-every-iteration)
 [[ "${SKIP_DROP_CACHE}" == "true" ]] && PYTEST_ARGS+=(--skip-drop-cache)
 [[ "${SKIP_ANALYZE_CHECK}" == "true" ]] && PYTEST_ARGS+=(--skip-analyze-check)
 

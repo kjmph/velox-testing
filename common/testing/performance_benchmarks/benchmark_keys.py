@@ -17,6 +17,7 @@ class BenchmarkKeys(str, Enum):
     MEDIAN_KEY = "median"
     GMEAN_KEY = "geometric_mean"
     LUKEWARM_KEY = "lukewarm"
+    COLD_KEY = "cold"
     TAG_KEY = "tag"
     CONTEXT_KEY = "context"
     ITERATIONS_COUNT_KEY = "iterations_count"

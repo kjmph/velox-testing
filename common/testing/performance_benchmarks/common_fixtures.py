@@ -18,8 +18,13 @@ def benchmark_result_collector(request):
 @pytest.fixture(scope="session", autouse=True)
 def drop_cache_once(request):
     """Session-scoped fixture that drops the cache once at the start of the benchmark run."""
-    drop_cache_enabled = not request.config.getoption("--skip-drop-cache")
-    if drop_cache_enabled:
+    memory_cold_mode = request.config.getoption("--cold", default=False) or request.config.getoption(
+        "--cold-every-iteration", default=False
+    )
+    skip_drop_cache = request.config.getoption("--skip-drop-cache")
+    if memory_cold_mode:
+        print("[Cache] Skipping system cache drop (controlled memory-cold mode preserves the OS page cache).")
+    elif not skip_drop_cache:
         drop_cache()
         print("[Cache] System cache dropped successfully.")
     else:

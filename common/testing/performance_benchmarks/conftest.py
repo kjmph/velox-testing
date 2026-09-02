@@ -10,6 +10,15 @@ import pytest
 
 from .benchmark_keys import BenchmarkKeys
 
+CACHE_MODE_DEFAULT = "default"
+CACHE_MODE_COLD_ONCE = "cold-once"
+CACHE_MODE_COLD_EVERY_ITERATION = "cold-every-iteration"
+_CACHE_MODES = {
+    CACHE_MODE_DEFAULT,
+    CACHE_MODE_COLD_ONCE,
+    CACHE_MODE_COLD_EVERY_ITERATION,
+}
+
 
 @dataclass
 class DataLocation:
@@ -18,9 +27,77 @@ class DataLocation:
     key: str
 
 
+def _cache_mode(config):
+    cold_once = config.getoption("--cold", default=False)
+    cold_every_iteration = config.getoption("--cold-every-iteration", default=False)
+    if cold_once and cold_every_iteration:
+        raise pytest.UsageError("--cold and --cold-every-iteration are mutually exclusive")
+    if cold_every_iteration:
+        return CACHE_MODE_COLD_EVERY_ITERATION
+    if cold_once:
+        return CACHE_MODE_COLD_ONCE
+    return CACHE_MODE_DEFAULT
+
+
+def _validate_cache_mode(cache_mode):
+    if cache_mode not in _CACHE_MODES:
+        raise ValueError(f"Unknown benchmark cache mode: {cache_mode!r}")
+
+
+def _aggregate_headers(iterations, cache_mode):
+    _validate_cache_mode(cache_mode)
+    if cache_mode == CACHE_MODE_COLD_EVERY_ITERATION and iterations > 1:
+        return [
+            "Avg Cold(ms)",
+            "Min Cold(ms)",
+            "Max Cold(ms)",
+            "Median Cold(ms)",
+            "GMean Cold(ms)",
+        ]
+    if cache_mode != CACHE_MODE_DEFAULT and iterations == 1:
+        return ["Cold(ms)"]
+    if iterations > 1:
+        headers = [
+            "Avg Hot(ms)",
+            "Min Hot(ms)",
+            "Max Hot(ms)",
+            "Median Hot(ms)",
+            "GMean Hot(ms)",
+        ]
+        headers.append("Cold(ms)" if cache_mode == CACHE_MODE_COLD_ONCE else "Lukewarm(ms)")
+        return headers
+    return ["Lukewarm(ms)"]
+
+
+def _aggregate_keys(iterations, cache_mode):
+    _validate_cache_mode(cache_mode)
+    if cache_mode == CACHE_MODE_COLD_EVERY_ITERATION and iterations > 1:
+        return [
+            BenchmarkKeys.AVG_KEY,
+            BenchmarkKeys.MIN_KEY,
+            BenchmarkKeys.MAX_KEY,
+            BenchmarkKeys.MEDIAN_KEY,
+            BenchmarkKeys.GMEAN_KEY,
+        ]
+    if cache_mode != CACHE_MODE_DEFAULT and iterations == 1:
+        return [BenchmarkKeys.COLD_KEY]
+    if iterations > 1:
+        keys = [
+            BenchmarkKeys.AVG_KEY,
+            BenchmarkKeys.MIN_KEY,
+            BenchmarkKeys.MAX_KEY,
+            BenchmarkKeys.MEDIAN_KEY,
+            BenchmarkKeys.GMEAN_KEY,
+        ]
+        keys.append(BenchmarkKeys.COLD_KEY if cache_mode == CACHE_MODE_COLD_ONCE else BenchmarkKeys.LUKEWARM_KEY)
+        return keys
+    return [BenchmarkKeys.LUKEWARM_KEY]
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     text_report = []
     iterations = config.getoption("--iterations")
+    cache_mode = _cache_mode(config)
     tag = config.getoption("--tag")
     if not hasattr(terminalreporter._session, "benchmark_results"):
         return
@@ -43,17 +120,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             _write_line(terminalreporter, text_report, f"Tag: {tag}")
         _write_line(terminalreporter, text_report, "")
 
-        if iterations > 1:
-            AGG_HEADERS = [
-                "Avg Hot(ms)",
-                "Min Hot(ms)",
-                "Max Hot(ms)",
-                "Median Hot(ms)",
-                "GMean Hot(ms)",
-                "Lukewarm(ms)",
-            ]
-        else:
-            AGG_HEADERS = ["Lukewarm(ms)"]
+        AGG_HEADERS = _aggregate_headers(iterations, cache_mode)
         width = max([len(agg_header) for agg_header in AGG_HEADERS])
         width = max(width, result[BenchmarkKeys.FORMAT_WIDTH_KEY]) + 2  # Additional padding on each side
         header = " Query ID "
@@ -112,27 +179,18 @@ def build_and_write_benchmark_result(session, json_result):
     before calling this function.
     """
     iterations = session.config.getoption("--iterations")
+    cache_mode = _cache_mode(session.config)
 
     bench_output_dir = get_output_dir(session.config)
     bench_output_dir.mkdir(parents=True, exist_ok=True)
 
-    if iterations > 1:
-        AGG_KEYS = [
-            BenchmarkKeys.AVG_KEY,
-            BenchmarkKeys.MIN_KEY,
-            BenchmarkKeys.MAX_KEY,
-            BenchmarkKeys.MEDIAN_KEY,
-            BenchmarkKeys.GMEAN_KEY,
-            BenchmarkKeys.LUKEWARM_KEY,
-        ]
-    else:
-        AGG_KEYS = [BenchmarkKeys.LUKEWARM_KEY]
+    AGG_KEYS = _aggregate_keys(iterations, cache_mode)
 
     if not hasattr(session, "benchmark_results"):
         return
 
     for benchmark_type, result in session.benchmark_results.items():
-        compute_aggregate_timings(result)
+        compute_aggregate_timings(result, cache_mode=cache_mode)
         json_result[benchmark_type] = {
             BenchmarkKeys.AGGREGATE_TIMES_KEY: {},
             BenchmarkKeys.RAW_TIMES_KEY: result[BenchmarkKeys.RAW_TIMES_KEY],
@@ -189,14 +247,23 @@ def get_output_dir(config):
     return Path(bench_output_dir)
 
 
-def compute_aggregate_timings(benchmark_results):
+def compute_aggregate_timings(benchmark_results, cache_mode=CACHE_MODE_DEFAULT):
+    _validate_cache_mode(cache_mode)
     raw_times = benchmark_results[BenchmarkKeys.RAW_TIMES_KEY]
     benchmark_results[BenchmarkKeys.AGGREGATE_TIMES_KEY] = {}
     format_width = 0
     for query_id, timings in raw_times.items():
         if timings:
             first_iteration = timings[0]
-            if len(timings) > 1:
+            if cache_mode == CACHE_MODE_COLD_EVERY_ITERATION and len(timings) > 1:
+                stats = (
+                    round(statistics.mean(timings), 2),
+                    min(timings),
+                    max(timings),
+                    statistics.median(timings),
+                    round(statistics.geometric_mean(timings), 2),
+                )
+            elif len(timings) > 1:
                 hot_timings = timings[1:]
                 stats = (
                     round(statistics.mean(hot_timings), 2),
