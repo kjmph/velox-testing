@@ -156,6 +156,17 @@ UCX DEV TUNING:
         Maximum rendezvous rails (default: 2, matching OpenUCX). Falls back to
         the standard UCX_MAX_RNDV_RAILS environment variable when unset.
 
+GPU NUMA PLACEMENT:
+    PRESTO_GPU_NUMA_BINDING=auto|required|off
+        For one-container-per-GPU layouts, discover the GPU-local CPU set and
+        memory NUMA node from nvidia-smi and sysfs. The rendered service uses a
+        cgroup CPU set and the worker applies a matching numactl memory policy.
+        "auto" (default) logs and continues without a strict process policy if
+        topology is unavailable; "required" fails the worker instead of
+        silently losing locality; "off" disables both the rendered CPU set and
+        the worker's GPU NUMA placement. GPUs on the same NUMA node share that
+        node's CPU set; this selects locality, not exclusive CPU ownership.
+
 Examples:
     $0 -w 2 --wait -b worker --restart-target worker
     $0 -w 2 -g 2,3 --wait -b worker --restart-target worker
@@ -1327,6 +1338,7 @@ RENDER_SCCACHE=false
 if [[ "$ENABLE_SCCACHE" == true ]] && build_targets_include_gpu_worker; then
   RENDER_SCCACHE=true
 fi
+GPU_NUMA_BINDING_POLICY="${PRESTO_GPU_NUMA_BINDING:-auto}"
 RENDER_ARGS=(
   --template-path "$TEMPLATE_PATH"
   --output-path "$RENDERED_PATH"
@@ -1335,11 +1347,13 @@ RENDER_ARGS=(
   --kvikio-threads "$KVIKIO_THREADS"
   --sccache "$RENDER_SCCACHE"
   --variant gpu
+  --gpu-numa-binding "$GPU_NUMA_BINDING_POLICY"
 )
 if [[ -n "${GPU_IDS:-}" ]]; then
   RENDER_ARGS+=(--gpu-ids "$GPU_IDS")
 fi
 python "$RENDER_SCRIPT_PATH" "${RENDER_ARGS[@]}"
+echo "GPU NUMA placement policy: ${GPU_NUMA_BINDING_POLICY}"
 DOCKER_COMPOSE_FILE_PATH="$RENDERED_PATH"
 
 COMPOSE_FILE_ARGS=(-f "$DOCKER_COMPOSE_FILE_PATH")
