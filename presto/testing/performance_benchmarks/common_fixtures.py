@@ -17,6 +17,11 @@ from .metrics_collector import collect_metrics
 from .run_context import gather_run_context
 
 
+def _cursor_query_id(cursor):
+    query = getattr(cursor, "_query", None)
+    return getattr(query, "query_id", None)
+
+
 def session_properties_from_config(config):
     properties = {}
     for item in config.getoption("--session-property") or []:
@@ -138,6 +143,9 @@ def benchmark_query(request, presto_cursor, benchmark_queries, benchmark_result_
 
     def benchmark_query_function(query_id):
         profile_output_file_path = None
+        metrics_query_id = None
+        metrics_collection_attempted = set()
+        query_was_submitted = False
         try:
             if cold:
                 clear_result = clear_worker_memory_caches(hostname=hostname, port=port)
@@ -157,9 +165,11 @@ def benchmark_query(request, presto_cursor, benchmark_queries, benchmark_result_
                         f"[Cache] {benchmark_type} {query_id} iteration {iteration_num + 1}/{iterations}: "
                         f"cleared {len(clear_result.worker_uris)} native-worker memory cache(s)."
                     )
+                query_was_submitted = True
                 cursor = presto_cursor.execute(
                     "--" + str(benchmark_type) + "_" + str(query_id) + "--" + "\n" + benchmark_queries[query_id]
                 )
+                metrics_query_id = _cursor_query_id(cursor)
                 result.append(cursor.stats["elapsedTimeMillis"])
 
                 # Save query results to Parquet (only on first iteration)
@@ -175,18 +185,35 @@ def benchmark_query(request, presto_cursor, benchmark_queries, benchmark_result_
                     df.to_parquet(parquet_path, index=False)
 
                 # Collect metrics after each query iteration if enabled
-                if metrics:
-                    presto_query_id = cursor._query.query_id
-                    if presto_query_id:
+                if metrics and metrics_query_id:
+                    metrics_collection_attempted.add(metrics_query_id)
+                    collect_metrics(
+                        query_id=metrics_query_id,
+                        query_name=str(query_id),
+                        hostname=hostname,
+                        port=port,
+                        output_dir=bench_output_dir,
+                    )
+                query_was_submitted = False
+                metrics_query_id = None
+            raw_times_dict[query_id] = result
+        except Exception as e:
+            if metrics and query_was_submitted:
+                failed_query_id = getattr(e, "query_id", None) or metrics_query_id or _cursor_query_id(presto_cursor)
+                if failed_query_id and failed_query_id not in metrics_collection_attempted:
+                    try:
                         collect_metrics(
-                            query_id=presto_query_id,
+                            query_id=failed_query_id,
                             query_name=str(query_id),
                             hostname=hostname,
                             port=port,
                             output_dir=bench_output_dir,
                         )
-            raw_times_dict[query_id] = result
-        except Exception as e:
+                    except Exception as metrics_error:
+                        print(
+                            f"[Metrics] Failed to collect diagnostics for failed query "
+                            f"{failed_query_id}: {metrics_error}"
+                        )
             error_type = getattr(e, "error_type", type(e).__name__)
             error_name = getattr(e, "error_name", str(e))
             failed_queries_dict[query_id] = f"{error_type}: {error_name}"

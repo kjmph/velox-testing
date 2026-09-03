@@ -47,7 +47,7 @@ OPTIONS:
                             All iterations are cold. Neither mode clears SSD or OS page caches.
     --skip-drop-cache       Skip dropping system caches once before the benchmark run.
     --skip-analyze-check    Skip checking that ANALYZE TABLE has been run on all tables (checked by default).
-    -m, --metrics           Collect detailed metrics from Presto REST API after each query.
+    -m, --metrics           Collect detailed metrics from Presto REST API after each query, including failures.
                             Metrics are stored in query-specific directories.
     -v, --verbose           Print debug logs for worker/engine detection
                             (e.g. node URIs, cluster-tag, GPU model).
