@@ -33,19 +33,16 @@ x-presto-native-worker-gpu: &gpu_worker_base
             - driver: nvidia
               count: all
               capabilities: [gpu]
-  # devices:
-    #   # required for GDS
-    #   - /dev/infiniband/rdma_cm
-    #   - /dev/infiniband/uverbs0
-    #   - /dev/infiniband/uverbs1
-    #   - /dev/infiniband/uverbs2
-    #   - /dev/infiniband/uverbs3
-    #   - /dev/infiniband/uverbs4
-    #   - /dev/infiniband/uverbs5
-    #   - /dev/infiniband/uverbs6
-    #   - /dev/infiniband/uverbs7
-    #   - /dev/infiniband/uverbs8
-    #   - /dev/infiniband/uverbs9
+{% if ucx_efa | default(false) %}
+  # AWS EFA character devices. EFA/SRD is opt-in so ordinary GPU and every
+  # CPU launch remain independent of host RDMA devices.
+  devices:
+    - /dev/infiniband/rdma_cm
+    - /dev/infiniband/uverbs0
+    - /dev/infiniband/uverbs1
+    - /dev/infiniband/uverbs2
+    - /dev/infiniband/uverbs3
+{% endif %}
   depends_on:
     - presto-coordinator
   privileged: true
@@ -78,6 +75,9 @@ services:
   presto-native-worker-gpu-{{ gpu_id }}:
     <<: *gpu_worker_base
     container_name: presto-native-worker-gpu-{{ gpu_id }}
+{% if ucx_efa | default(false) %}
+    network_mode: host
+{% endif %}
     labels:
       com.nvidia.velox-testing.gpu-id: "{{ gpu_id }}"
       com.nvidia.velox-testing.gpu-numa-policy: "{{ effective_gpu_numa_binding }}"
@@ -117,10 +117,22 @@ services:
       VELOX_CUDF_DISABLE_LOCAL_MERGE: ${VELOX_CUDF_DISABLE_LOCAL_MERGE:-}
       VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN: ${VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN:-0}
       VELOX_CUDF_SERIALIZE_HASH_BUILDS: ${VELOX_CUDF_SERIALIZE_HASH_BUILDS:-0}
+{% if ucx_efa | default(false) %}
+      PRESTO_UCX_EFA_ENABLED: "true"
+      UCX_RNDV_FRAG_SIZE: "${UCX_RNDV_FRAG_SIZE:-cuda:32M}"
+      UCX_RNDV_FRAG_MEM_TYPES: "${UCX_RNDV_FRAG_MEM_TYPES:-cuda}"
+      UCX_SOCKADDR_TLS_PRIORITY: "${UCX_SOCKADDR_TLS_PRIORITY:-tcp}"
+      UCX_NET_DEVICES: "${UCX_NET_DEVICES_GPU_{{ gpu_id }}:-}"
+{% endif %}
       UCX_LOG_LEVEL: info #debug
-      UCX_RNDV_PIPELINE_ERROR_HANDLING: y
+      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
+{% if ucx_efa | default(false) %}
+      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy}"
+      UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-1}"
+{% else %}
       UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"
       UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"
+{% endif %}
       UCX_TCP_CM_REUSEADDR: y
       UCX_PROTO_INFO: y
       # don't know, leave it for now
@@ -139,6 +151,9 @@ services:
   presto-native-worker-gpu:
     <<: *gpu_worker_base
     container_name: presto-native-worker-gpu
+{% if ucx_efa | default(false) %}
+    network_mode: host
+{% endif %}
     labels:
       com.nvidia.velox-testing.gpu-numa-policy: "{{ effective_gpu_numa_binding }}"
       com.nvidia.velox-testing.gpu-numa-topology-source: "{{ 'disabled' if effective_gpu_numa_binding == 'off' else 'runtime-discovery' }}"
@@ -165,10 +180,24 @@ services:
       VELOX_CUDF_DISABLE_LOCAL_MERGE: ${VELOX_CUDF_DISABLE_LOCAL_MERGE:-}
       VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN: ${VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN:-0}
       VELOX_CUDF_SERIALIZE_HASH_BUILDS: ${VELOX_CUDF_SERIALIZE_HASH_BUILDS:-0}
+{% if ucx_efa | default(false) %}
+      PRESTO_UCX_EFA_ENABLED: "true"
+      UCX_RNDV_FRAG_SIZE: "${UCX_RNDV_FRAG_SIZE:-cuda:32M}"
+      UCX_RNDV_FRAG_MEM_TYPES: "${UCX_RNDV_FRAG_MEM_TYPES:-cuda}"
+      UCX_SOCKADDR_TLS_PRIORITY: "${UCX_SOCKADDR_TLS_PRIORITY:-tcp}"
+{% for gpu_id in workers %}
+      UCX_NET_DEVICES_GPU_{{ gpu_id }}: "${UCX_NET_DEVICES_GPU_{{ gpu_id }}:-}"
+{% endfor %}
+{% endif %}
       UCX_LOG_LEVEL: info #debug
-      UCX_RNDV_PIPELINE_ERROR_HANDLING: y
+      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
+{% if ucx_efa | default(false) %}
+      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy}"
+      UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-1}"
+{% else %}
       UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"
       UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"
+{% endif %}
       UCX_TCP_CM_REUSEADDR: y
       UCX_PROTO_INFO: y
       # don't know, leave it for now
@@ -198,10 +227,22 @@ services:
       VELOX_CUDF_DISABLE_LOCAL_MERGE: ${VELOX_CUDF_DISABLE_LOCAL_MERGE:-}
       VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN: ${VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN:-0}
       VELOX_CUDF_SERIALIZE_HASH_BUILDS: ${VELOX_CUDF_SERIALIZE_HASH_BUILDS:-0}
+{% if ucx_efa | default(false) %}
+      PRESTO_UCX_EFA_ENABLED: "true"
+      UCX_RNDV_FRAG_SIZE: "${UCX_RNDV_FRAG_SIZE:-cuda:32M}"
+      UCX_RNDV_FRAG_MEM_TYPES: "${UCX_RNDV_FRAG_MEM_TYPES:-cuda}"
+      UCX_SOCKADDR_TLS_PRIORITY: "${UCX_SOCKADDR_TLS_PRIORITY:-tcp}"
+      UCX_NET_DEVICES: "${UCX_NET_DEVICES:-}"
+{% endif %}
       UCX_LOG_LEVEL: info #debug
-      UCX_RNDV_PIPELINE_ERROR_HANDLING: y
+      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
+{% if ucx_efa | default(false) %}
+      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy}"
+      UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-1}"
+{% else %}
       UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"
       UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"
+{% endif %}
       UCX_TCP_CM_REUSEADDR: y
       UCX_PROTO_INFO: y
       # don't know, leave it for now

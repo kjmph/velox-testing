@@ -191,6 +191,48 @@ class DetectGpuNumaBindingTest(unittest.TestCase):
         self.assertIn('com.nvidia.velox-testing.gpu-numa-topology-source: "runtime-discovery"', rendered)
         self.assertNotIn("cpuset:", rendered)
 
+    def test_gpu_efa_template_uses_host_network_and_per_gpu_devices(self):
+        rendered = self.gpu_template().render(
+            num_workers=2,
+            workers=[2, 5],
+            single_container=False,
+            kvikio_threads=8,
+            sccache=False,
+            variant="gpu",
+            ucx_efa=True,
+            gpu_numa_binding="off",
+        )
+
+        self.assertEqual(rendered.count("network_mode: host"), 2)
+        self.assertIn('PRESTO_UCX_EFA_ENABLED: "true"', rendered)
+        self.assertIn('UCX_NET_DEVICES: "${UCX_NET_DEVICES_GPU_2:-}"', rendered)
+        self.assertIn('UCX_NET_DEVICES: "${UCX_NET_DEVICES_GPU_5:-}"', rendered)
+        self.assertIn('UCX_RNDV_FRAG_SIZE: "${UCX_RNDV_FRAG_SIZE:-cuda:32M}"', rendered)
+        self.assertIn('UCX_RNDV_FRAG_MEM_TYPES: "${UCX_RNDV_FRAG_MEM_TYPES:-cuda}"', rendered)
+        self.assertIn('UCX_SOCKADDR_TLS_PRIORITY: "${UCX_SOCKADDR_TLS_PRIORITY:-tcp}"', rendered)
+        self.assertIn('UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"', rendered)
+        self.assertIn('UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy}"', rendered)
+        self.assertIn('UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-1}"', rendered)
+        self.assertIn("/dev/infiniband/rdma_cm", rendered)
+
+    def test_gpu_non_efa_template_remains_isolated(self):
+        rendered = self.gpu_template().render(
+            num_workers=1,
+            workers=[0],
+            single_container=False,
+            kvikio_threads=8,
+            sccache=False,
+            variant="gpu",
+            ucx_efa=False,
+            gpu_numa_binding="off",
+        )
+
+        self.assertNotIn("network_mode: host", rendered)
+        self.assertNotIn("PRESTO_UCX_EFA_ENABLED", rendered)
+        self.assertNotIn("/dev/infiniband/rdma_cm", rendered)
+        self.assertIn('UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"', rendered)
+        self.assertIn('UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"', rendered)
+
     def test_off_policy_suppresses_rendered_topology(self):
         rendered = self.gpu_template().render(
             num_workers=2,

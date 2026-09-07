@@ -165,11 +165,19 @@ CUDF DEV TUNING:
 
 UCX DEV TUNING:
     PRESTO_GPU_UCX_TLS=<UCX transport list>
-        GPU worker transports (default: tcp,cuda_copy,cuda_ipc). Falls back to
-        the standard UCX_TLS environment variable when unset.
+        GPU worker transports. The default is tcp,cuda_copy,cuda_ipc normally
+        and tcp,srd,cuda_copy with --ucx-efa. Falls back to UCX_TLS.
     PRESTO_GPU_UCX_MAX_RNDV_RAILS=<positive integer>
-        Maximum rendezvous rails (default: 2, matching OpenUCX). Falls back to
-        the standard UCX_MAX_RNDV_RAILS environment variable when unset.
+        Maximum rendezvous rails. The default is 2 normally and 1 with
+        --ucx-efa. Falls back to UCX_MAX_RNDV_RAILS.
+    PRESTO_GPU_UCX_RNDV_FRAG_SIZE=<UCX size>
+        EFA rendezvous fragment size (default: cuda:32M).
+    PRESTO_GPU_UCX_RNDV_FRAG_MEM_TYPES=<UCX memory types>
+        EFA rendezvous fragment memory type (default: cuda).
+    PRESTO_GPU_UCX_SOCKADDR_TLS_PRIORITY=<UCX transport list>
+        EFA connection-manager priority (default: tcp).
+    PRESTO_GPU_UCX_RNDV_PIPELINE_ERROR_HANDLING=y|n
+        Rendezvous pipeline error handling (default: y).
 
 GPU NUMA PLACEMENT:
     PRESTO_GPU_NUMA_BINDING=auto|required|off
@@ -222,8 +230,16 @@ function configure_dev_gpu_ucx_environment() {
     return 1
   fi
 
-  local tls="${PRESTO_GPU_UCX_TLS:-${UCX_TLS:-tcp,cuda_copy,cuda_ipc}}"
-  local max_rndv_rails="${PRESTO_GPU_UCX_MAX_RNDV_RAILS:-${UCX_MAX_RNDV_RAILS:-2}}"
+  local default_tls=tcp,cuda_copy,cuda_ipc
+  local default_max_rndv_rails=2
+  if [[ ${UCX_EFA:-false} == true ]]; then
+    default_tls=tcp,srd,cuda_copy
+    default_max_rndv_rails=1
+  fi
+
+  local tls="${PRESTO_GPU_UCX_TLS:-${UCX_TLS:-$default_tls}}"
+  local max_rndv_rails="${PRESTO_GPU_UCX_MAX_RNDV_RAILS:-${UCX_MAX_RNDV_RAILS:-$default_max_rndv_rails}}"
+  local pipeline_error_handling="${PRESTO_GPU_UCX_RNDV_PIPELINE_ERROR_HANDLING:-${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}}"
 
   if [[ -z "$tls" || "$tls" =~ ^[[:space:]]*$ ]]; then
     echo "ERROR: PRESTO_GPU_UCX_TLS must contain at least one UCX transport." >&2
@@ -233,10 +249,28 @@ function configure_dev_gpu_ucx_environment() {
     echo "ERROR: PRESTO_GPU_UCX_MAX_RNDV_RAILS must be a positive integer." >&2
     return 1
   fi
+  if [[ ! "$pipeline_error_handling" =~ ^[yn]$ ]]; then
+    echo "ERROR: PRESTO_GPU_UCX_RNDV_PIPELINE_ERROR_HANDLING must be y or n." >&2
+    return 1
+  fi
 
   export UCX_TLS="$tls"
   export UCX_MAX_RNDV_RAILS="$max_rndv_rails"
-  echo "Dev GPU UCX tuning: UCX_TLS=${UCX_TLS} UCX_MAX_RNDV_RAILS=${UCX_MAX_RNDV_RAILS}"
+  export UCX_RNDV_PIPELINE_ERROR_HANDLING="$pipeline_error_handling"
+  if [[ ${UCX_EFA:-false} == true ]]; then
+    export UCX_RNDV_FRAG_SIZE="${PRESTO_GPU_UCX_RNDV_FRAG_SIZE:-${UCX_RNDV_FRAG_SIZE:-cuda:32M}}"
+    export UCX_RNDV_FRAG_MEM_TYPES="${PRESTO_GPU_UCX_RNDV_FRAG_MEM_TYPES:-${UCX_RNDV_FRAG_MEM_TYPES:-cuda}}"
+    export UCX_SOCKADDR_TLS_PRIORITY="${PRESTO_GPU_UCX_SOCKADDR_TLS_PRIORITY:-${UCX_SOCKADDR_TLS_PRIORITY:-tcp}}"
+  fi
+
+  local message="Dev GPU UCX tuning: UCX_TLS=${UCX_TLS} UCX_MAX_RNDV_RAILS=${UCX_MAX_RNDV_RAILS}"
+  message+=" UCX_RNDV_PIPELINE_ERROR_HANDLING=${UCX_RNDV_PIPELINE_ERROR_HANDLING}"
+  if [[ ${UCX_EFA:-false} == true ]]; then
+    message+=" UCX_RNDV_FRAG_SIZE=${UCX_RNDV_FRAG_SIZE}"
+    message+=" UCX_RNDV_FRAG_MEM_TYPES=${UCX_RNDV_FRAG_MEM_TYPES}"
+    message+=" UCX_SOCKADDR_TLS_PRIORITY=${UCX_SOCKADDR_TLS_PRIORITY}"
+  fi
+  echo "$message"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -335,10 +369,6 @@ if [[ -n ${DEV_CUDA_VERSION} && ! ${DEV_CUDA_VERSION} =~ ^[0-9]+\.[0-9]+$ ]]; th
   echo "ERROR: --cuda-version must be a major.minor version such as 13.2." >&2
   exit 1
 fi
-if ! configure_dev_gpu_ucx_environment; then
-  exit 1
-fi
-
 # shellcheck source=s3_direct_receive_dev.sh
 source "${SCRIPT_DIR}/s3_direct_receive_dev.sh"
 if ! DEV_GPU_S3_READER_MODE="$(normalize_gpu_s3_reader_mode "${DEV_GPU_S3_READER_MODE}")"; then
@@ -428,6 +458,10 @@ set -- "${DEV_ARGS[@]}"
 set +u
 source "${SCRIPT_DIR}/start_presto_helper_parse_args.sh"
 set -u
+
+if ! configure_dev_gpu_ucx_environment; then
+  exit 1
+fi
 
 S3_DIRECT_CREDENTIAL_SOURCE=instance-profile
 if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
@@ -1048,16 +1082,22 @@ function apply_dev_node_addresses() {
   [[ -f "$coordinator_node_config" ]] || return
   set_properties_file_value "node.internal-address" "$COORDINATOR_SERVICE" "$coordinator_node_config"
 
-  local id worker_node_config worker_service
+  local id worker_node_config worker_config worker_service worker_address
   while IFS= read -r id; do
     worker_node_config="${config_dir}/etc_worker_${id}/node.properties"
     [[ -f "$worker_node_config" ]] || continue
-    if [[ -n "$NUM_WORKERS" && "$NUM_WORKERS" -gt 1 && "$SINGLE_CONTAINER" == "false" ]]; then
+    worker_config="${config_dir}/etc_worker_${id}/config_native.properties"
+    if [[ ${UCX_EFA:-false} == true ]]; then
+      worker_address="${PRESTO_WORKER_INTERNAL_ADDRESS}"
+      set_properties_file_value "discovery.uri" "http://127.0.0.1:8080" "$worker_config"
+    elif [[ -n "$NUM_WORKERS" && "$NUM_WORKERS" -gt 1 && "$SINGLE_CONTAINER" == "false" ]]; then
       worker_service="presto-native-worker-gpu-${id}"
+      worker_address="$worker_service"
     else
       worker_service="presto-native-worker-gpu"
+      worker_address="$worker_service"
     fi
-    set_properties_file_value "node.internal-address" "$worker_service" "$worker_node_config"
+    set_properties_file_value "node.internal-address" "$worker_address" "$worker_node_config"
   done < <(gpu_worker_ids)
 }
 
@@ -1080,22 +1120,26 @@ function render_dev_network_override() {
     printf "      presto_dev:\n"
     printf "        ipv4_address: %s\n" "$PRESTO_DEV_COORDINATOR_IP"
 
-    for i in "${!worker_services[@]}"; do
-      local service="${worker_services[$i]}"
-      local worker_ip_var="PRESTO_DEV_WORKER_${i}_IP"
-      local worker_ip="${!worker_ip_var:-}"
-      if [[ -z "$worker_ip" ]]; then
-        if [[ "${#worker_services[@]}" -eq 1 && -n "${PRESTO_DEV_WORKER_IP:-}" ]]; then
-          worker_ip="$PRESTO_DEV_WORKER_IP"
-        else
-          worker_ip="172.31.240.$((20 + i))"
+    if [[ ${UCX_EFA:-false} == true ]]; then
+      echo "# GPU workers use network_mode: host for EFA/SRD."
+    else
+      for i in "${!worker_services[@]}"; do
+        local service="${worker_services[$i]}"
+        local worker_ip_var="PRESTO_DEV_WORKER_${i}_IP"
+        local worker_ip="${!worker_ip_var:-}"
+        if [[ -z "$worker_ip" ]]; then
+          if [[ "${#worker_services[@]}" -eq 1 && -n "${PRESTO_DEV_WORKER_IP:-}" ]]; then
+            worker_ip="$PRESTO_DEV_WORKER_IP"
+          else
+            worker_ip="172.31.240.$((20 + i))"
+          fi
         fi
-      fi
-      printf "  %s:\n" "$service"
-      printf "    networks:\n"
-      printf "      presto_dev:\n"
-      printf "        ipv4_address: %s\n" "$worker_ip"
-    done
+        printf "  %s:\n" "$service"
+        printf "    networks:\n"
+        printf "      presto_dev:\n"
+        printf "        ipv4_address: %s\n" "$worker_ip"
+      done
+    fi
   } > "$override_path"
 
   echo "$override_path"
@@ -1379,6 +1423,7 @@ RENDER_ARGS=(
   --kvikio-threads "$KVIKIO_THREADS"
   --sccache "$RENDER_SCCACHE"
   --variant gpu
+  --ucx-efa "$UCX_EFA"
   --gpu-numa-binding "$GPU_NUMA_BINDING_POLICY"
 )
 if [[ -n "${GPU_IDS:-}" ]]; then
@@ -1443,7 +1488,11 @@ if [[ "$DEV_RESTART_TARGET" != "none" || "$WAIT_FOR_WORKERS" == "true" ]]; then
   ensure_dev_network
   ensure_coordinator_network_compatible
   prepare_worker_container_set
-  echo "Using dev Docker network: ${PRESTO_DEV_NETWORK_NAME} (${PRESTO_DEV_NETWORK_SUBNET})"
+  if [[ ${UCX_EFA:-false} == true ]]; then
+    echo "Using host networking for EFA GPU workers; coordinator remains on ${PRESTO_DEV_NETWORK_NAME}"
+  else
+    echo "Using dev Docker network: ${PRESTO_DEV_NETWORK_NAME} (${PRESTO_DEV_NETWORK_SUBNET})"
+  fi
 fi
 
 if (( ${#BUILD_TARGET_ARG[@]} )); then
@@ -1598,10 +1647,14 @@ function verify_gpu_worker_endpoints() {
   local id service port ip
 
   while read -r id service port; do
-    ip="$(container_ip_on_dev_network "$service")"
-    if [[ -z "$ip" ]]; then
-      echo "ERROR: unable to inspect Docker IP for ${service} on ${PRESTO_DEV_NETWORK_NAME}." >&2
-      return 1
+    if [[ ${UCX_EFA:-false} == true ]]; then
+      ip="${PRESTO_WORKER_INTERNAL_ADDRESS}"
+    else
+      ip="$(container_ip_on_dev_network "$service")"
+      if [[ -z "$ip" ]]; then
+        echo "ERROR: unable to inspect Docker IP for ${service} on ${PRESTO_DEV_NETWORK_NAME}." >&2
+        return 1
+      fi
     fi
     expected_lines+=("${id} ${service} ${ip} ${port}")
   done < <(gpu_expected_worker_entries)

@@ -203,7 +203,7 @@ if [[ "$VARIANT_TYPE" == "gpu" || ( "$VARIANT_TYPE" == "cpu" && -f "$TEMPLATE_PA
   LOCAL_NUM_WORKERS="${NUM_WORKERS:-0}"
 
   RENDER_SCRIPT_PATH=$(readlink -f "${SCRIPT_DIR}/../../template_rendering/render_docker_compose_template.py")
-  RENDER_ARGS="--template-path $TEMPLATE_PATH --output-path $RENDERED_PATH --num-workers $NUM_WORKERS --single-container $SINGLE_CONTAINER --kvikio-threads $KVIKIO_THREADS --sccache $ENABLE_SCCACHE --variant $VARIANT_TYPE"
+  RENDER_ARGS="--template-path $TEMPLATE_PATH --output-path $RENDERED_PATH --num-workers $NUM_WORKERS --single-container $SINGLE_CONTAINER --kvikio-threads $KVIKIO_THREADS --sccache $ENABLE_SCCACHE --variant $VARIANT_TYPE --ucx-efa $UCX_EFA"
   if [[ "$VARIANT_TYPE" == "gpu" && -n $GPU_IDS ]]; then
     RENDER_ARGS="$RENDER_ARGS --gpu-ids $GPU_IDS"
   fi

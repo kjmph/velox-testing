@@ -520,6 +520,18 @@ launch_worker() {
     esac
 
     cuda_env=("CUDA_VISIBLE_DEVICES=$worker_id")
+    local ucx_device_env_name="UCX_NET_DEVICES_GPU_${worker_id}"
+    local ucx_device="${UCX_NET_DEVICES:-}"
+    if [[ -n ${!ucx_device_env_name:-} ]]; then
+      ucx_device="${!ucx_device_env_name}"
+    fi
+    if [[ -n "$ucx_device" ]]; then
+      cuda_env+=("UCX_NET_DEVICES=$ucx_device")
+      echo "UCX network devices: ${ucx_device}" | tee -a "$log_file"
+    elif [[ ${PRESTO_UCX_EFA_ENABLED:-false} == true ]]; then
+      echo "ERROR: EFA/SRD is enabled but no UCX network devices were assigned to GPU ${worker_id}." | tee -a "$log_file" >&2
+      return 1
+    fi
     if command -v nvidia-smi >/dev/null 2>&1; then
       gpu_name="$(run_nvidia_smi --query-gpu=name --format=csv,noheader -i "$worker_id" 2>/dev/null || true)"
     fi

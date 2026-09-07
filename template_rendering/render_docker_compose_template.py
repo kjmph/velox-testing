@@ -184,6 +184,14 @@ def parse_args():
         "'gpu' uses per-GPU assignment via --gpu-ids.",
     )
     parser.add_argument(
+        "--ucx-efa",
+        type=str_to_bool,
+        default=False,
+        dest="ucx_efa",
+        required=False,
+        help="Enable host-network EFA/SRD plumbing for GPU workers.",
+    )
+    parser.add_argument(
         "--gpu-numa-binding",
         type=str,
         default=os.environ.get("PRESTO_GPU_NUMA_BINDING", "auto"),
@@ -263,6 +271,7 @@ def main() -> int:
         kvikio_threads=parsed_args.kvikio_threads,
         sccache=parsed_args.sccache,
         variant=parsed_args.variant,
+        ucx_efa=parsed_args.ucx_efa,
         gpu_numa_bindings=gpu_numa_bindings,
         gpu_numa_binding=parsed_args.gpu_numa_binding,
     )
