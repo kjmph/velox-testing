@@ -48,14 +48,25 @@ BASE_ID="sha256:$(printf 'b%.0s' {1..64})"
 
 mkdir -p \
   "${PRESTO_NATIVE_DIR}/velox" \
+  "${PRESTO_NATIVE_DIR}/scripts/dockerfiles" \
   "${VELOX_SOURCE}/scripts" \
   "${VELOX_SOURCE}/CMake" \
   "${FAKE_BIN}"
 touch "${PRESTO_SOURCE}/pom.xml"
 touch "${PRESTO_NATIVE_DIR}/docker-compose.yml"
+printf '%s\n' \
+  'ARG UCX_LOCAL_SOURCE=scripts' \
+  'ARG UCX_LOCAL_SOURCE_HASH=none' \
+  'RUN --mount=type=bind,source=${UCX_LOCAL_SOURCE},target=/local_ucx_source,ro true' \
+  'RUN touch /opt/presto-ucx-build/installed_artifacts.sha256' \
+  > "${PRESTO_NATIVE_DIR}/scripts/dockerfiles/centos-dependency.dockerfile"
 touch "${VELOX_SOURCE}/CMakeLists.txt"
 touch "${VELOX_SOURCE}/scripts/setup-centos9.sh"
 touch "${VELOX_SOURCE}/scripts/setup-common.sh"
+printf '%s\n' \
+  'UCX_LOCAL_SOURCE=${UCX_LOCAL_SOURCE:-}' \
+  '../contrib/configure-release --with-efa' \
+  >> "${VELOX_SOURCE}/scripts/setup-centos9.sh"
 printf 'original\n' > "${PRESTO_NATIVE_DIR}/velox/original-marker"
 printf 'selected\n' > "${VELOX_SOURCE}/scripts/selected-marker"
 printf 'S3_DIRECT_RECEIVE_CURL_COMMIT="%s"\nS3_DIRECT_RECEIVE_AWS_SDK_COMMIT="%s"\n' \
@@ -283,6 +294,21 @@ UCX_SOURCE="${TEST_ROOT}/ucx"
 mkdir -p "${UCX_SOURCE}"
 printf 'ucx-source\n' > "${UCX_SOURCE}/marker"
 printf '#!/bin/sh\n' > "${UCX_SOURCE}/autogen.sh"
+printf '*.generated\n' > "${UCX_SOURCE}/.gitignore"
+printf 'generated-v1\n' > "${UCX_SOURCE}/configure.generated"
+ln -s marker "${UCX_SOURCE}/marker-link"
+git -C "${UCX_SOURCE}" init -q
+git -C "${UCX_SOURCE}" add autogen.sh marker marker-link .gitignore
+git -C "${UCX_SOURCE}" \
+  -c user.name=test -c user.email=test@example.com \
+  commit -qm 'fixture'
+# shellcheck source=ucx_source_helpers.sh
+source "${SCRIPT_DIR}/ucx_source_helpers.sh"
+UCX_HASH_WITH_IGNORED_V1=$(compute_ucx_source_hash "${UCX_SOURCE}")
+printf 'generated-v2\n' > "${UCX_SOURCE}/configure.generated"
+UCX_HASH_WITH_IGNORED_V2=$(compute_ucx_source_hash "${UCX_SOURCE}")
+[[ ${UCX_HASH_WITH_IGNORED_V1} != "${UCX_HASH_WITH_IGNORED_V2}" ]] ||
+  fail 'UCX payload hash ignored a generated file copied into the build context'
 reset_fake_images
 "${BUILD_SCRIPT}" \
   --presto-source "${PRESTO_SOURCE}" \
@@ -292,6 +318,8 @@ reset_fake_images
   --image-name test.example/presto-deps:cuda13.2-ucx
 assert_contains '--build-arg CUDA_VERSION=13.2' "${DOCKER_LOG}"
 assert_contains '--build-arg UCX_LOCAL_SOURCE=.local_ucx_source' "${DOCKER_LOG}"
+assert_contains '--build-arg UCX_VERSION=1.22.0' "${DOCKER_LOG}"
+assert_contains '--env PRESTO_EXPECTED_UCX_VERSION=1.22.0' "${DOCKER_LOG}"
 assert_contains '--tag test.example/presto-deps:cuda13.2-ucx' "${DOCKER_LOG}"
 [[ ! -e ${PRESTO_NATIVE_DIR}/.local_ucx_source ]] ||
   fail 'the staged local UCX source was not removed'

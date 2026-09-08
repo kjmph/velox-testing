@@ -796,6 +796,12 @@ assert_not_contains '--s3-reader-mode' "${CPU_LAUNCHER}"
 assert_contains 'config/template/etc_worker/catalog/hive.properties' "${GPU_LAUNCHER}"
 assert_contains 'ARG S3_DIRECT_RECEIVE=OFF' "${NATIVE_DOCKERFILE}"
 assert_contains '-DVELOX_ENABLE_S3_DIRECT_RECEIVE=ON' "${NATIVE_DOCKERFILE}"
+# UCXX uses config-mode find_package(ucx), so the exact package directory must
+# survive S3 direct receive's independent CMAKE_PREFIX_PATH selection.
+# shellcheck disable=SC2016
+assert_contains 'ucx_cmake_dir="${ucx_lib_dir}/cmake/ucx"' "${NATIVE_DOCKERFILE}"
+# shellcheck disable=SC2016
+assert_contains '-Ducx_DIR=${ucx_cmake_dir}' "${NATIVE_DOCKERFILE}"
 # shellcheck disable=SC2016
 assert_contains '-DAWSSDK_ROOT_DIR=${S3_DIRECT_RECEIVE_PREFIX}' "${NATIVE_DOCKERFILE}"
 # shellcheck disable=SC2016

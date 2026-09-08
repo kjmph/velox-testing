@@ -15,6 +15,7 @@ DEV_JAVA_CLEAN="${PRESTO_DEV_JAVA_CLEAN:-false}"
 DEV_PRESTO_DEPENDENCIES="${PRESTO_DEV_PRESTO_DEPENDENCIES:-false}"
 DEV_PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
 DEV_UCX_SOURCE="${PRESTO_DEV_UCX_SOURCE:-}"
+DEV_UCX_VERSION="${PRESTO_DEV_UCX_VERSION:-}"
 DEV_VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
 DEV_CUDF_SOURCE="${PRESTO_DEV_CUDF_SOURCE:-}"
 DEV_CUDA_VERSION="${PRESTO_DEV_CUDA_VERSION:-}"
@@ -69,6 +70,9 @@ DEV_OPTIONS:
     --ucx-source PATH
         Rebuild the local Presto dependency image from this UCX source tree
         before building GPU workers. Can also be set with PRESTO_DEV_UCX_SOURCE.
+    --ucx-version X.Y.Z
+        Version expected from --ucx-source (default: 1.22.0). The dependency
+        and worker images verify both this value and the exact source hash.
     --velox-source PATH
         Build native GPU workers from this Velox source tree instead of the
         default ../velox sibling. The path must be inside the Docker build
@@ -253,6 +257,15 @@ function configure_dev_gpu_ucx_environment() {
     echo "ERROR: PRESTO_GPU_UCX_RNDV_PIPELINE_ERROR_HANDLING must be y or n." >&2
     return 1
   fi
+  if [[ ${UCX_EFA:-false} == true ]]; then
+    local transport
+    for transport in srd cuda_copy; do
+      if [[ ",${tls}," != *,all,* && ",${tls}," != *,"${transport}",* ]]; then
+        echo "ERROR: --ucx-efa requires PRESTO_GPU_UCX_TLS to select ${transport}; got ${tls}." >&2
+        return 1
+      fi
+    done
+  fi
 
   export UCX_TLS="$tls"
   export UCX_MAX_RNDV_RAILS="$max_rndv_rails"
@@ -309,6 +322,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ucx-source)
       DEV_UCX_SOURCE=${2:?Error: --ucx-source requires a value}
+      shift 2
+      ;;
+    --ucx-version)
+      DEV_UCX_VERSION=${2:?Error: --ucx-version requires a value}
       shift 2
       ;;
     --velox-source)
@@ -369,6 +386,10 @@ if [[ -n ${DEV_CUDA_VERSION} && ! ${DEV_CUDA_VERSION} =~ ^[0-9]+\.[0-9]+$ ]]; th
   echo "ERROR: --cuda-version must be a major.minor version such as 13.2." >&2
   exit 1
 fi
+if [[ -n ${DEV_UCX_VERSION} && ! ${DEV_UCX_VERSION} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "ERROR: --ucx-version must be a major.minor.patch version such as 1.22.0." >&2
+  exit 1
+fi
 # shellcheck source=s3_direct_receive_dev.sh
 source "${SCRIPT_DIR}/s3_direct_receive_dev.sh"
 if ! DEV_GPU_S3_READER_MODE="$(normalize_gpu_s3_reader_mode "${DEV_GPU_S3_READER_MODE}")"; then
@@ -427,6 +448,10 @@ if [[ -n "$DEV_UCX_SOURCE" ]]; then
     echo "ERROR: --ucx-source must point to a UCX source tree with autogen.sh." >&2
     exit 1
   fi
+  DEV_UCX_VERSION="${DEV_UCX_VERSION:-1.22.0}"
+elif [[ -n ${DEV_UCX_VERSION} ]]; then
+  echo "ERROR: --ucx-version requires --ucx-source." >&2
+  exit 1
 fi
 
 if [[ -n "$DEV_VELOX_SOURCE" ]]; then
@@ -494,6 +519,39 @@ function effective_presto_source() {
 
 function validate_sibling_repos() {
   "${REPO_ROOT}/scripts/validate_directories_exist.sh" "$(effective_presto_source)" "$(effective_velox_source)"
+}
+
+# shellcheck source=ucx_source_helpers.sh
+source "${SCRIPT_DIR}/ucx_source_helpers.sh"
+
+PRESTO_EXPECTED_UCX_VERSION=''
+PRESTO_EXPECTED_UCX_SOURCE_HASH=''
+if [[ -n ${DEV_UCX_SOURCE} ]]; then
+  PRESTO_EXPECTED_UCX_VERSION=${DEV_UCX_VERSION}
+  PRESTO_EXPECTED_UCX_SOURCE_HASH=$(compute_ucx_source_hash "${DEV_UCX_SOURCE}")
+  export PRESTO_EXPECTED_UCX_VERSION PRESTO_EXPECTED_UCX_SOURCE_HASH
+fi
+
+function load_ucx_dependency_provenance() {
+  local image=$1
+  local provenance
+
+  if ! provenance=$(docker run --rm --entrypoint /bin/bash "$image" -c '
+      set -euo pipefail
+      cat /opt/presto-ucx-build/requested_version
+      cat /opt/presto-ucx-build/local_source_hash
+    '); then
+    echo "ERROR: ${image} does not contain exact UCX build provenance." >&2
+    return 1
+  fi
+  PRESTO_EXPECTED_UCX_VERSION=$(sed -n '1p' <<< "$provenance")
+  PRESTO_EXPECTED_UCX_SOURCE_HASH=$(sed -n '2p' <<< "$provenance")
+  if [[ ! ${PRESTO_EXPECTED_UCX_VERSION} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ||
+    ! ${PRESTO_EXPECTED_UCX_SOURCE_HASH} =~ ^[0-9a-f]{64}$ ]]; then
+    echo "ERROR: invalid exact UCX provenance in ${image}." >&2
+    return 1
+  fi
+  export PRESTO_EXPECTED_UCX_VERSION PRESTO_EXPECTED_UCX_SOURCE_HASH
 }
 
 function validate_sccache_auth() {
@@ -1359,6 +1417,13 @@ if [[ -n "$NUM_WORKERS" && "$NUM_WORKERS" -gt 1 && "$SINGLE_CONTAINER" == "false
   GPU_WORKER_SERVICE="presto-native-worker-gpu-${FIRST_GPU_ID}"
 fi
 conditionally_add_build_target "$GPU_WORKER_IMAGE" "$GPU_WORKER_SERVICE" "worker|w"
+if [[ -n ${DEV_UCX_SOURCE} ]]; then
+  build_targets_include_gpu_worker || {
+    echo "ERROR: --ucx-source requires a GPU worker build target." >&2
+    echo "Use -b worker (or remove --ucx-source to restart the already-built image)." >&2
+    exit 1
+  }
+fi
 
 LOGS_DIR="${LOGS_DIR:-${SCRIPT_DIR}/presto_logs}"
 if [[ "$DEV_RESTART_TARGET" == "all" || "$DEV_CLEAN_FIRST" == "true" ]]; then
@@ -1518,6 +1583,7 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
       --velox-source "$(effective_velox_source)"
     )
     [[ -n "$DEV_UCX_SOURCE" ]] && DEPS_BUILD_ARGS+=(--ucx-source "$DEV_UCX_SOURCE")
+    [[ -n "$DEV_UCX_SOURCE" ]] && DEPS_BUILD_ARGS+=(--ucx-version "$DEV_UCX_VERSION")
     [[ -n "$DEV_CUDA_VERSION" ]] && DEPS_BUILD_ARGS+=(--cuda-version "$DEV_CUDA_VERSION")
     [[ -n "${SKIP_CACHE_ARG:-}" ]] && DEPS_BUILD_ARGS+=(--no-cache)
     "${SCRIPT_DIR}/build_centos_deps_image.sh" "${DEPS_BUILD_ARGS[@]}"
@@ -1538,6 +1604,13 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
         "$(effective_presto_source)" \
         "$(effective_velox_source)" \
         "${DIRECT_DEPS_NO_CACHE}" || exit 1
+    fi
+
+    if [[ ${UCX_EFA:-false} == true ]]; then
+      if [[ -z ${PRESTO_EXPECTED_UCX_SOURCE_HASH} ]]; then
+        load_ucx_dependency_provenance "${DEPS_IMAGE}" || exit 1
+      fi
+      echo "Using exact UCX ${PRESTO_EXPECTED_UCX_VERSION} (${PRESTO_EXPECTED_UCX_SOURCE_HASH})"
     fi
 
     NATIVE_BUILD_CACHE_SCOPE="$(
@@ -1595,6 +1668,8 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
     --build-arg "BUILD_TYPE=${BUILD_TYPE}" \
     --build-arg "CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}" \
     --build-arg "S3_DIRECT_RECEIVE=$([[ ${DEV_S3_DIRECT_RECEIVE} == true ]] && echo ON || echo OFF)" \
+    --build-arg "EXPECTED_UCX_VERSION=${PRESTO_EXPECTED_UCX_VERSION}" \
+    --build-arg "EXPECTED_UCX_SOURCE_HASH=${PRESTO_EXPECTED_UCX_SOURCE_HASH}" \
     "${SCCACHE_BUILD_ARGS[@]}" \
     "${BUILD_TARGET_ARG[@]}"
 fi

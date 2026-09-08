@@ -15,6 +15,7 @@ NO_CACHE_ARG=''
 S3_DIRECT_RECEIVE=false
 UCX_SOURCE=''
 UCX_SOURCE_HASH=''
+REQUESTED_UCX_VERSION="${PRESTO_DEV_UCX_VERSION:-}"
 REQUESTED_CUDA_VERSION="${PRESTO_DEV_CUDA_VERSION:-}"
 PRESTO_SOURCE="${PRESTO_DEV_PRESTO_SOURCE:-}"
 VELOX_SOURCE="${PRESTO_DEV_VELOX_SOURCE:-}"
@@ -43,6 +44,8 @@ OPTIONS:
     --velox-source PATH  Velox source tree providing dependency setup scripts
                          and CMake modules (default: ../velox)
     --ucx-source PATH    Local UCX source tree to build into the dependency image
+    --ucx-version X.Y.Z  UCX version recorded and verified for --ucx-source
+                         (default: 1.22.0)
     --cuda-version X.Y   CUDA toolkit major.minor version to install in an
                          ordinary dependency image (for example, 13.2). Direct
                          mode inherits CUDA from --base-image instead.
@@ -59,6 +62,8 @@ Environment:
                          Same as --velox-source.
     PRESTO_DEV_CUDA_VERSION
                          Same as --cuda-version.
+    PRESTO_DEV_UCX_VERSION
+                         Same as --ucx-version.
 
 EOF
 }
@@ -111,6 +116,15 @@ parse_args() {
           exit 1
         fi
         ;;
+      --ucx-version)
+        if [[ -n $2 ]]; then
+          REQUESTED_UCX_VERSION=$2
+          shift 2
+        else
+          echo "Error: --ucx-version requires a value"
+          exit 1
+        fi
+        ;;
       --cuda-version)
         if [[ -n $2 ]]; then
           REQUESTED_CUDA_VERSION=$2
@@ -146,6 +160,10 @@ parse_args "$@"
 
 if [[ -n ${REQUESTED_CUDA_VERSION} && ! ${REQUESTED_CUDA_VERSION} =~ ^[0-9]+\.[0-9]+$ ]]; then
   echo "Error: --cuda-version must be a major.minor version such as 13.2" >&2
+  exit 1
+fi
+if [[ -n ${REQUESTED_UCX_VERSION} && ! ${REQUESTED_UCX_VERSION} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Error: --ucx-version must be a major.minor.patch version such as 1.22.0" >&2
   exit 1
 fi
 
@@ -249,6 +267,9 @@ fi
 
 # Compute the directory where this script resides
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=ucx_source_helpers.sh
+source "${SCRIPT_DIR}/ucx_source_helpers.sh"
 
 # Get the root of the git repository
 REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
@@ -361,29 +382,78 @@ if [[ -n "${UCX_SOURCE}" ]]; then
     echo "Error: --ucx-source must point to a UCX source tree with autogen.sh"
     exit 1
   fi
+  REQUESTED_UCX_VERSION="${REQUESTED_UCX_VERSION:-1.22.0}"
+  validate_local_ucx_build_contract "${PRESTO_SOURCE}" "${VELOX_SOURCE}"
+elif [[ -n ${REQUESTED_UCX_VERSION} ]]; then
+  echo "Error: --ucx-version requires --ucx-source" >&2
+  exit 1
 fi
 
-function compute_ucx_source_hash {
-  if git -C "${UCX_SOURCE}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    {
-      git -C "${UCX_SOURCE}" rev-parse HEAD || true
-      git -C "${UCX_SOURCE}" status --short --untracked-files=all || true
-      git -C "${UCX_SOURCE}" diff --binary HEAD -- || true
+function verify_custom_ucx_dependency_image {
+  local image=$1
+  local expected_version=$2
+  local expected_hash=$3
 
-      local file
-      while IFS= read -r -d '' file; do
-        [[ -f "${UCX_SOURCE}/${file}" ]] || continue
-        printf 'untracked:%s:' "$file"
-        sha256sum "${UCX_SOURCE}/${file}" | awk '{print $1}'
-      done < <(git -C "${UCX_SOURCE}" ls-files --others --exclude-standard -z | sort -z)
-    } | sha256sum | awk '{print $1}'
-  else
-    find "${UCX_SOURCE}" -path "${UCX_SOURCE}/.git" -prune -o -type f -print0 |
-      sort -z |
-      xargs -0 sha256sum |
-      sha256sum |
-      awk '{print $1}'
-  fi
+  docker run --rm \
+    --env "PRESTO_EXPECTED_UCX_VERSION=${expected_version}" \
+    --env "PRESTO_EXPECTED_UCX_SOURCE_HASH=${expected_hash}" \
+    --entrypoint /bin/bash "${image}" -c '
+      set -euo pipefail
+      marker=/opt/presto-ucx-build
+      test "$(<"${marker}/requested_version")" = "${PRESTO_EXPECTED_UCX_VERSION}"
+      test "$(<"${marker}/local_source_hash")" = "${PRESTO_EXPECTED_UCX_SOURCE_HASH}"
+      test "${PRESTO_EXPECTED_UCX_SOURCE_HASH}" != none
+
+      actual_version=$(ucx_info -v | awk "/Library version:/{print \$4; exit}")
+      test "${actual_version}" = "${PRESTO_EXPECTED_UCX_VERSION}"
+      actual_library=$(ucx_info -v | awk "/Library path:/{print \$4; exit}")
+      test -n "${actual_library}"
+      lib_dir=$(dirname "${actual_library}")
+      module_dir="${lib_dir}/ucx"
+      cmake_dir="${lib_dir}/cmake/ucx"
+      for package_file in \
+        ucx-config.cmake \
+        ucx-config-version.cmake \
+        ucx-targets.cmake; do
+        test -f "${cmake_dir}/${package_file}"
+      done
+      marker_manifest="${marker}/installed_artifacts.sha256"
+      test -s "${marker_manifest}"
+      recorded_manifest_digest=$(<"${marker}/installed_artifacts_manifest_sha256")
+      actual_recorded_digest=$(sha256sum "${marker_manifest}" | awk "{print \$1}")
+      test "${recorded_manifest_digest}" = "${actual_recorded_digest}"
+
+      actual_manifest=$(mktemp)
+      for artifact in \
+        libucm.so \
+        libucp.so \
+        libucs.so \
+        libuct.so \
+        ucx/libuct_cuda.so \
+        ucx/libuct_ib_efa.so; do
+        resolved=$(readlink -f "${lib_dir}/${artifact}")
+        test -f "${resolved}"
+        digest=$(sha256sum "${resolved}" | awk "{print \$1}")
+        printf "%s  %s\\n" "${digest}" "${artifact}" >> "${actual_manifest}"
+      done
+      cmp -s "${marker_manifest}" "${actual_manifest}"
+      rm -f "${actual_manifest}"
+
+      for plugin in "${module_dir}/libuct_cuda.so" "${module_dir}/libuct_ib_efa.so"; do
+        if ! ldd_output=$(ldd "${plugin}" 2>&1); then
+          echo "Unable to inspect UCX plugin dependencies: ${plugin}" >&2
+          echo "${ldd_output}" >&2
+          exit 1
+        fi
+        unresolved=$(grep "not found" <<<"${ldd_output}" | grep -v -E "libcuda\\.so|libnvidia" || true)
+        if [[ -n ${unresolved} ]]; then
+          echo "UCX plugin has unresolved dependencies: ${plugin}" >&2
+          echo "${unresolved}" >&2
+          exit 1
+        fi
+      done
+    '
+  echo "Validated exact UCX ${expected_version} (${expected_hash}) in ${image}"
 }
 
 PRESTO_NATIVE_DIR="${PRESTO_SOURCE}/presto-native-execution"
@@ -463,7 +533,7 @@ if [[ -n ${REQUESTED_CUDA_VERSION} ]]; then
   BUILD_ARGS+=(--build-arg "ARM_BUILD_TARGET=${ARM_BUILD_TARGET:-}")
 fi
 if [[ -n "${UCX_SOURCE}" ]]; then
-  UCX_SOURCE_HASH="$(compute_ucx_source_hash)"
+  UCX_SOURCE_HASH="$(compute_ucx_source_hash "${UCX_SOURCE}")"
   echo "Using UCX_LOCAL_SOURCE_HASH=${UCX_SOURCE_HASH}"
   echo "Staging local UCX source from ${UCX_SOURCE}..."
   rm -rf "${LOCAL_UCX_CONTEXT}"
@@ -471,10 +541,19 @@ if [[ -n "${UCX_SOURCE}" ]]; then
   if command -v rsync > /dev/null 2>&1; then
     rsync -a --delete --exclude .git "${UCX_SOURCE}/" "${LOCAL_UCX_CONTEXT}/"
   else
-    tar -C "${UCX_SOURCE}" --exclude ./.git --exclude .git -cf - . | tar -C "${LOCAL_UCX_CONTEXT}" -xf -
+    tar -C "${UCX_SOURCE}" --exclude ./.git --exclude .git --exclude '*/.git' -cf - . |
+      tar -C "${LOCAL_UCX_CONTEXT}" -xf -
+  fi
+  STAGED_UCX_SOURCE_HASH=$(compute_ucx_source_hash "${LOCAL_UCX_CONTEXT}")
+  if [[ ${STAGED_UCX_SOURCE_HASH} != "${UCX_SOURCE_HASH}" ]]; then
+    echo "Error: staged UCX payload does not match the selected source tree" >&2
+    echo "Selected: ${UCX_SOURCE_HASH}" >&2
+    echo "Staged:   ${STAGED_UCX_SOURCE_HASH}" >&2
+    exit 1
   fi
   BUILD_ARGS+=(--build-arg "UCX_LOCAL_SOURCE=${LOCAL_UCX_CONTEXT}")
   BUILD_ARGS+=(--build-arg "UCX_LOCAL_SOURCE_HASH=${UCX_SOURCE_HASH}")
+  BUILD_ARGS+=(--build-arg "UCX_VERSION=${REQUESTED_UCX_VERSION}")
 fi
 
 # now build
@@ -524,6 +603,11 @@ else
       docker tag "${COMPOSE_IMAGE_NAME}" "${IMAGE_NAME}"
     fi
   fi
+fi
+
+if [[ -n ${UCX_SOURCE} ]]; then
+  verify_custom_ucx_dependency_image \
+    "${IMAGE_NAME}" "${REQUESTED_UCX_VERSION}" "${UCX_SOURCE_HASH}"
 fi
 
 # done (will cleanup on exit)

@@ -29,6 +29,11 @@ ARG SCCACHE_NO_DIST_COMPILE
 ARG VELOX_TESTING_SOURCE_HASH=unknown
 ARG NATIVE_BUILD_CACHE_SCOPE=default
 ARG S3_DIRECT_RECEIVE=OFF
+ARG EXPECTED_UCX_VERSION=
+ARG EXPECTED_UCX_SOURCE_HASH=
+
+ENV PRESTO_EXPECTED_UCX_VERSION=${EXPECTED_UCX_VERSION} \
+    PRESTO_EXPECTED_UCX_SOURCE_HASH=${EXPECTED_UCX_SOURCE_HASH}
 
 # Override ARM_BUILD_TARGET to prevent get_cxx_flags() in Velox's
 # setup-helper-functions.sh from reading the MIDR_EL1 register and emitting
@@ -63,6 +68,8 @@ ENV CC=/opt/rh/gcc-toolset-14/root/bin/gcc \
     SCCACHE_S3_PREPROCESSOR_CACHE_KEY_PREFIX=velox-testing/preprocessor-cache
 
 RUN mkdir /runtime-libraries
+
+COPY velox-testing/presto/docker/verify_ucx_runtime.sh /opt/verify_ucx_runtime.sh
 
 RUN \
     --mount=type=bind,source=presto/presto-native-execution,target=/presto_native_staging/presto \
@@ -101,6 +108,22 @@ case "${S3_DIRECT_RECEIVE}" in
     exit 1;
     ;;
 esac;
+
+if [ "${GPU}" = "ON" ] && [ -n "${EXPECTED_UCX_SOURCE_HASH}" ]; then
+  /opt/verify_ucx_runtime.sh --build-check;
+  ucx_library=$(ucx_info -v | awk '/Library path:/{print $4; exit}');
+  ucx_lib_dir=$(dirname "${ucx_library}");
+  ucx_prefix=$(dirname "${ucx_lib_dir}");
+  ucx_cmake_dir="${ucx_lib_dir}/cmake/ucx";
+  export PATH="${ucx_prefix}/bin:${PATH}";
+  export LD_LIBRARY_PATH="${ucx_lib_dir}:${ucx_lib_dir}/ucx${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}";
+  export UCX_MODULE_DIR="${ucx_lib_dir}/ucx";
+  export PKG_CONFIG_PATH="${ucx_lib_dir}/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}";
+  EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} \
+    -DUCX_LIBRARY=${ucx_lib_dir}/libucp.so \
+    -DUCX_INCLUDE_DIR=${ucx_prefix}/include \
+    -Ducx_DIR=${ucx_cmake_dir}";
+fi;
 
 # Clear stale CMake cache if the compiler changed
 if [ -f "${BUILD_BASE_DIR}/CMakeCache.txt" ]; then
@@ -155,7 +178,8 @@ ldd_output=$(LD_LIBRARY_PATH="${LDD_LIBRARY_PATH}" ldd "${PRESTO_SERVER}");
 # prefix intact.
 awk -v direct_mode="${S3_DIRECT_RECEIVE}" \
   -v direct_prefix="${S3_DIRECT_RECEIVE_PREFIX}/lib/" \
-  'NF == 4 && $3 != "not" && $1 !~ /libcuda\.so|libnvidia/ && !(direct_mode == "ON" && index($3, direct_prefix) == 1) { print $3 }' \
+  -v exact_ucx="${EXPECTED_UCX_SOURCE_HASH}" \
+  'NF == 4 && $3 != "not" && $1 !~ /libcuda\.so|libnvidia/ && !(direct_mode == "ON" && index($3, direct_prefix) == 1) && !(exact_ucx != "" && $1 ~ /^lib(ucm|ucp|ucs|uct)\.so/) { print $3 }' \
   <<<"${ldd_output}" | sort -u | xargs -r -I{} cp -L "{}" /runtime-libraries/;
 
 if [ "${S3_DIRECT_RECEIVE}" = "ON" ]; then
@@ -215,6 +239,16 @@ RUN set -euxo pipefail; \
         grep -F 'Aws::Http::GetDirectResponseReceiveStrictKernelTlsApiVersionV1()' >/dev/null; \
       nm -D -C --defined-only "${aws_core}" | \
         grep -F 'Aws::Http::GetAdaptiveTcpMssApiVersionV1()' >/dev/null; \
+    fi && \
+    if [ "${GPU}" = "ON" ] && [ -n "${EXPECTED_UCX_SOURCE_HASH}" ]; then \
+      /opt/verify_ucx_runtime.sh --build-check; \
+      ucx_library=$(ucx_info -v | awk '/Library path:/{print $4; exit}'); \
+      ucx_lib_dir=$(dirname "${ucx_library}"); \
+      resolved_ucp=$(ldd /usr/bin/presto_server | awk '$1 ~ /^libucp\.so/ {print $3; exit}'); \
+      case "${resolved_ucp}" in \
+        "${ucx_lib_dir}"/*) ;; \
+        *) echo "presto_server resolved libucp outside exact UCX: ${resolved_ucp:-missing}" >&2; exit 1 ;; \
+      esac; \
     fi
 
 COPY velox-testing/presto/docker/launch_presto_servers.sh velox-testing/presto/docker/presto_profiling_wrapper.sh /opt

@@ -96,7 +96,7 @@ case "$*" in
     while true; do sleep 1; done
     ;;
 esac
-printf 'mock presto_server %s\n' "$*"
+printf 'mock presto_server %s UCX_NET_DEVICES=%s\n' "$*" "${UCX_NET_DEVICES:-}"
 EOF
 chmod +x "${TEST_ROOT}/bin/nvidia-smi" "${TEST_ROOT}/bin/numactl" \
   "${TEST_ROOT}/bin/presto_server"
@@ -203,6 +203,7 @@ export PRESTO_GPU_CPU_NUMA_NODE=0
 export PRESTO_GPU_MEMORY_NUMA_NODE=0
 export PRESTO_GPU_NUMA_BINDING=required
 export TEST_NUMACTL_ARGS="${TEST_ROOT}/numactl.args"
+export UCX_NET_DEVICES_GPU_0='rdmap0s0:1,enp1s0'
 launch_worker 0 /tmp/etc
 wait_for_workers
 
@@ -215,8 +216,9 @@ grep -F 'Effective NUMA policy:' "${WORKER_LOG}" >/dev/null ||
   fail 'effective policy heading was not logged'
 grep -F 'policy: bind' "${WORKER_LOG}" >/dev/null ||
   fail 'effective memory policy was not logged'
-grep -F 'mock presto_server --etc-dir=/tmp/etc' "${WORKER_LOG}" >/dev/null ||
+grep -F 'mock presto_server --etc-dir=/tmp/etc UCX_NET_DEVICES=rdmap0s0:1,enp1s0' "${WORKER_LOG}" >/dev/null ||
   fail 'mock worker was not executed'
+unset UCX_NET_DEVICES_GPU_0
 
 # Auto mode may start unbound when runtime topology is unavailable and no
 # cgroup cpuset was rendered. Required mode must reject the same condition.

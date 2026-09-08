@@ -520,10 +520,12 @@ launch_worker() {
     esac
 
     cuda_env=("CUDA_VISIBLE_DEVICES=$worker_id")
-    local ucx_device_env_name="UCX_NET_DEVICES_GPU_${worker_id}"
     local ucx_device="${UCX_NET_DEVICES:-}"
-    if [[ -n ${!ucx_device_env_name:-} ]]; then
-      ucx_device="${!ucx_device_env_name}"
+    if [[ $worker_id =~ ^[0-9]+$ ]]; then
+      local ucx_device_env_name="UCX_NET_DEVICES_GPU_${worker_id}"
+      if [[ -n ${!ucx_device_env_name:-} ]]; then
+        ucx_device="${!ucx_device_env_name}"
+      fi
     fi
     if [[ -n "$ucx_device" ]]; then
       cuda_env+=("UCX_NET_DEVICES=$ucx_device")
@@ -591,6 +593,17 @@ exec "$@"'
 main() {
   # Run ldconfig once after the runtime image and any mounted libraries exist.
   ldconfig
+  if [[ ${PRESTO_UCX_EFA_ENABLED:-false} == true ]]; then
+    local ucx_library
+    local ucx_module_dir
+    ucx_library=$(ucx_info -v | awk '/Library path:/{print $4; exit}')
+    ucx_module_dir="$(dirname "$ucx_library")/ucx"
+    export UCX_MODULE_DIR="$ucx_module_dir"
+    /opt/verify_ucx_runtime.sh
+    # UCX interprets every UCX_* variable as runtime configuration. This name
+    # is dependency-build input, not a runtime setting.
+    unset UCX_VERSION
+  fi
   mkdir -p "${LOGS_DIR}"
   : "${SERVER_START_TIMESTAMP:?SERVER_START_TIMESTAMP must be set before starting the container}"
   trap 'handle_launcher_error "$?"' ERR

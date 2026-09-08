@@ -38,6 +38,8 @@ services:
       args:
         - BASE_IMAGE=${DEPS_IMAGE:-presto/prestissimo-dependency:centos9-${USER}}
         - S3_DIRECT_RECEIVE=${S3_DIRECT_RECEIVE:-OFF}
+        - EXPECTED_UCX_VERSION=${PRESTO_EXPECTED_UCX_VERSION:-}
+        - EXPECTED_UCX_SOURCE_HASH=${PRESTO_EXPECTED_UCX_SOURCE_HASH:-}
     environment:
       - GLOG_logtostderr=1
       - PRESTO_COMPUTE_SANITIZER=${PRESTO_COMPUTE_SANITIZER:-0}
