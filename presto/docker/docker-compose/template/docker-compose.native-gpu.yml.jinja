@@ -125,11 +125,12 @@ services:
       UCX_NET_DEVICES: "${UCX_NET_DEVICES_GPU_{{ gpu_id }}:-}"
 {% endif %}
       UCX_LOG_LEVEL: info #debug
-      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
 {% if ucx_efa | default(false) %}
-      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy}"
+      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-n}"
+      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy,self}"
       UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-1}"
 {% else %}
+      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
       UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"
       UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"
 {% endif %}
@@ -190,11 +191,12 @@ services:
 {% endfor %}
 {% endif %}
       UCX_LOG_LEVEL: info #debug
-      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
 {% if ucx_efa | default(false) %}
-      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy}"
+      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-n}"
+      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy,self}"
       UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-1}"
 {% else %}
+      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
       UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"
       UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"
 {% endif %}
@@ -235,11 +237,12 @@ services:
       UCX_NET_DEVICES: "${UCX_NET_DEVICES:-}"
 {% endif %}
       UCX_LOG_LEVEL: info #debug
-      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
 {% if ucx_efa | default(false) %}
-      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy}"
+      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-n}"
+      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy,self}"
       UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-1}"
 {% else %}
+      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"
       UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"
       UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"
 {% endif %}

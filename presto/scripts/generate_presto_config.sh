@@ -23,6 +23,25 @@ function echo_success {
   echo -e "${GREEN}$1${NC}"
 }
 
+function append_config_overrides() {
+  local overrides_dir=$1
+  local src_file rel_path dest_file
+  local -a override_files=()
+
+  [[ -d "${overrides_dir}" ]] || return 0
+  mapfile -d '' override_files < <(
+    find "${overrides_dir}" -type f -print0 | LC_ALL=C sort -z
+  )
+  for src_file in "${override_files[@]}"; do
+    rel_path="${src_file#"${overrides_dir}"/}"
+    dest_file="${CONFIG_DIR}/${rel_path}"
+    [[ -f "${dest_file}" ]] || continue
+
+    printf '\n' >> "${dest_file}"
+    cat "${src_file}" >> "${dest_file}"
+  done
+}
+
 # Compute the directory where this script resides
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -151,41 +170,32 @@ EOF
     sed -i "s|hive.metastore.catalog.dir=.*|hive.metastore.uri=${HIVE_METASTORE_URI}|" "${CONFIG_DIR}/etc_coordinator/catalog/hive.properties" "${CONFIG_DIR}/etc_worker/catalog/hive.properties"
   fi
 
-  COORD_CONFIG="${CONFIG_DIR}/etc_coordinator/config_native.properties"
-  WORKER_CONFIG="${CONFIG_DIR}/etc_worker/config_native.properties"
-  # now perform other variant-specific modifications to the generated configs
-  if [[ "${VARIANT_TYPE}" == "gpu" ]]; then
-    # for GPU variant, uncomment these optimizer settings
-    # optimizer.joins-not-null-inference-strategy=USE_FUNCTION_METADATA
-    # optimizer.default-filter-factor-enabled=true
-    sed -i 's/\#optimizer/optimizer/g' ${COORD_CONFIG}
-    echo "cluster-tag=native-gpu" >>${COORD_CONFIG}
-  fi
-
-  if [[ "${VARIANT_TYPE}" == "cpu" ]]; then
-    echo "cluster-tag=native-cpu" >>${COORD_CONFIG}
-  fi
-
-  # for Java variant, disable some Parquet properties which are now rejected
-  if [[ "${VARIANT_TYPE}" == "java" ]]; then
-    HIVE_CONFIG="${CONFIG_DIR}/etc_worker/catalog/hive.properties"
-    sed -i 's/parquet\.reader\.chunk-read-limit/#parquet\.reader\.chunk-read-limit/' ${HIVE_CONFIG}
-    sed -i 's/parquet\.reader\.pass-read-limit/#parquet\.reader\.pass-read-limit/' ${HIVE_CONFIG}
-    sed -i 's/^cudf/#cudf/' ${HIVE_CONFIG}
-  fi
-
-  if [[ "${VARIANT_TYPE}" != "gpu" ]]; then
-    HIVE_CONFIG="${CONFIG_DIR}/etc_worker/catalog/hive.properties"
-    sed -i 's/hive.file-splittable=false/hive.file-splittable=true/' ${HIVE_CONFIG}
-    HIVE_CONFIG="${CONFIG_DIR}/etc_coordinator/catalog/hive.properties"
-    sed -i 's/hive.file-splittable=false/hive.file-splittable=true/' ${HIVE_CONFIG}
-  fi
+  # Apply variant-specific defaults after rendering the common templates.
+  append_config_overrides \
+    "${SCRIPT_DIR}/../docker/config/template/overrides/${VARIANT_TYPE}"
 
   # success message
   echo_success "Configs were generated successfully"
 else
   # otherwise, reuse existing config
   echo_success "Reusing existing Presto Config files for '${VARIANT_TYPE}'"
+fi
+
+# EFA can be toggled while reusing an existing generated GPU config. Reconcile
+# its worker properties on every launch so non-EFA settings cannot remain stale
+# and an EFA restart does not depend on --overwrite-config.
+if [[ "${VARIANT_TYPE}" == "gpu" ]]; then
+  GPU_BASE_WORKER_CONFIG="${CONFIG_DIR}/etc_worker/config_native.properties"
+  if [[ -f "${GPU_BASE_WORKER_CONFIG}" ]]; then
+    sed -i \
+      -e '/^ucxx\.error_handling=/d' \
+      -e '/^ucxx\.blocking_polling=/d' \
+      "${GPU_BASE_WORKER_CONFIG}"
+    if [[ "${UCX_EFA:-false}" == "true" ]]; then
+      append_config_overrides \
+        "${SCRIPT_DIR}/../docker/config/template/overrides/ucx-efa"
+    fi
+  fi
 fi
 
 # A replicated cuDF join builds a full copy on every GPU. The generated limit is

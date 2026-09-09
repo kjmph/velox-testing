@@ -7,6 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TEST_ROOT=$(mktemp -d "${SCRIPT_DIR}/.s3_direct_receive_dev_test.XXXXXX")
+GPU_WORKER_CATALOG_PROFILE="${SCRIPT_DIR}/../docker/config/template/overrides/gpu/etc_worker/catalog/hive.properties"
 trap 'rm -rf -- "${TEST_ROOT}"' EXIT
 
 # shellcheck disable=SC1091
@@ -499,6 +500,15 @@ for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
 done
 
+# The launcher restores the variant profile—not the now variant-neutral common
+# template—when S3 direct receive is disabled.
+apply_s3_direct_receive_worker_catalogs \
+  gpu false "${CONFIG_ROOT}" "${GPU_WORKER_CATALOG_PROFILE}"
+for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
+  [[ $(grep -c '^cudf.hive.use-buffered-input=false$' "${file}") -eq 1 ]] ||
+    fail "GPU disabled mode did not restore the GPU reader profile in ${file}"
+done
+
 unset GPU_HOST_RESERVE_GB GPU_SYSTEM_MEM_LIMIT_GB \
   GPU_SYSTEM_MEM_GB GPU_QUERY_MEM_GB || true
 for mode in kvikio buffered; do
@@ -706,6 +716,10 @@ render_s3_direct_receive_compose_override \
 CPU_LAUNCHER="${SCRIPT_DIR}/start_native_cpu_presto_dev.sh"
 GPU_LAUNCHER="${SCRIPT_DIR}/start_native_gpu_presto_dev.sh"
 GPU_COMPOSE_TEMPLATE="${SCRIPT_DIR}/../docker/docker-compose/template/docker-compose.native-gpu.yml.jinja"
+CONFIG_GENERATOR="${SCRIPT_DIR}/generate_presto_config.sh"
+COMMON_WORKER_CONFIG="${SCRIPT_DIR}/../docker/config/template/etc_worker/config_native.properties"
+GPU_WORKER_PROFILE="${SCRIPT_DIR}/../docker/config/template/overrides/gpu/etc_worker/config_native.properties"
+EFA_WORKER_PROFILE="${SCRIPT_DIR}/../docker/config/template/overrides/ucx-efa/etc_worker/config_native.properties"
 NATIVE_DOCKERFILE="${SCRIPT_DIR}/../docker/native_build.dockerfile"
 S3_DIRECT_DEPS_DOCKERFILE="${SCRIPT_DIR}/../docker/s3_direct_receive_deps.dockerfile"
 ADAPTERS_DOCKERFILE="${SCRIPT_DIR}/../../velox/docker/adapters_build.dockerfile"
@@ -773,8 +787,23 @@ assert_contains 'apply_gpu_worker_memory_and_cache_config' "${GPU_LAUNCHER}"
 assert_contains 'apply_gpu_s3_coordinator_config' "${GPU_LAUNCHER}"
 assert_contains 'reconcile_gpu_s3_coordinator_restart_target' "${GPU_LAUNCHER}"
 assert_contains 'configure_dev_gpu_ucx_environment' "${GPU_LAUNCHER}"
+assert_contains 'apply_dev_ucxx_tuning' "${GPU_LAUNCHER}"
 assert_contains 'PRESTO_GPU_UCX_TLS' "${GPU_LAUNCHER}"
 assert_contains 'PRESTO_GPU_UCX_MAX_RNDV_RAILS' "${GPU_LAUNCHER}"
+assert_contains 'function append_config_overrides()' "${CONFIG_GENERATOR}"
+# This assertion intentionally matches a literal shell variable.
+# shellcheck disable=SC2016
+assert_contains 'template/overrides/${VARIANT_TYPE}' "${CONFIG_GENERATOR}"
+assert_contains 'template/overrides/ucx-efa' "${CONFIG_GENERATOR}"
+assert_not_contains 'cudf.enabled=true' "${COMMON_WORKER_CONFIG}"
+assert_contains 'cudf.streaming_groupby_api_enabled=true' "${GPU_WORKER_PROFILE}"
+assert_contains 'cudf.exchange_compression=column-adaptive-freq-pfor-min128' "${GPU_WORKER_PROFILE}"
+assert_contains 'cudf.exchange_compression_pipeline=true' "${GPU_WORKER_PROFILE}"
+assert_contains 'cudf.partitioned_output_batch_rows=10000000' "${GPU_WORKER_PROFILE}"
+assert_contains 'cudf.batch_size_min_threshold=40000000' "${GPU_WORKER_PROFILE}"
+assert_contains 'ucxx.error_handling=false' "${EFA_WORKER_PROFILE}"
+assert_contains 'ucxx.blocking_polling=false' "${EFA_WORKER_PROFILE}"
+assert_contains 'template/overrides/gpu/etc_worker/catalog/hive.properties' "${GPU_LAUNCHER}"
 assert_gpu_launcher_rejects_ucx_environment \
   'UCX_MAX_RDNV_RAILS is misspelled; use UCX_MAX_RNDV_RAILS.' \
   UCX_MAX_RDNV_RAILS=1
@@ -791,9 +820,14 @@ assert_not_contains '--s3-reader-mode' "${CPU_LAUNCHER}"
 [[ $(grep -Fxc '      UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"' "${GPU_COMPOSE_TEMPLATE}") -eq 3 ]] ||
   fail 'GPU compose template does not forward UCX_TLS to every worker layout'
 # shellcheck disable=SC2016
+[[ $(grep -Fxc '      UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy,self}"' "${GPU_COMPOSE_TEMPLATE}") -eq 3 ]] ||
+  fail 'GPU EFA compose template does not preserve pure SRD in every worker layout'
+# shellcheck disable=SC2016
+[[ $(grep -Fxc '      UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-n}"' "${GPU_COMPOSE_TEMPLATE}") -eq 3 ]] ||
+  fail 'GPU EFA compose template does not disable pipeline error handling in every worker layout'
+# shellcheck disable=SC2016
 [[ $(grep -Fxc '      UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"' "${GPU_COMPOSE_TEMPLATE}") -eq 3 ]] ||
   fail 'GPU compose template does not forward UCX_MAX_RNDV_RAILS to every worker layout'
-assert_contains 'config/template/etc_worker/catalog/hive.properties' "${GPU_LAUNCHER}"
 assert_contains 'ARG S3_DIRECT_RECEIVE=OFF' "${NATIVE_DOCKERFILE}"
 assert_contains '-DVELOX_ENABLE_S3_DIRECT_RECEIVE=ON' "${NATIVE_DOCKERFILE}"
 # UCXX uses config-mode find_package(ucx), so the exact package directory must

@@ -210,8 +210,10 @@ class DetectGpuNumaBindingTest(unittest.TestCase):
         self.assertIn('UCX_RNDV_FRAG_SIZE: "${UCX_RNDV_FRAG_SIZE:-cuda:32M}"', rendered)
         self.assertIn('UCX_RNDV_FRAG_MEM_TYPES: "${UCX_RNDV_FRAG_MEM_TYPES:-cuda}"', rendered)
         self.assertIn('UCX_SOCKADDR_TLS_PRIORITY: "${UCX_SOCKADDR_TLS_PRIORITY:-tcp}"', rendered)
-        self.assertIn('UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"', rendered)
-        self.assertIn('UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy}"', rendered)
+        self.assertIn('UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-n}"', rendered)
+        self.assertIn(
+            'UCX_TLS: "${UCX_TLS:-tcp,srd,cuda_copy,self}"', rendered
+        )
         self.assertIn('UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-1}"', rendered)
         self.assertIn("/dev/infiniband/rdma_cm", rendered)
 
@@ -230,6 +232,7 @@ class DetectGpuNumaBindingTest(unittest.TestCase):
         self.assertNotIn("network_mode: host", rendered)
         self.assertNotIn("PRESTO_UCX_EFA_ENABLED", rendered)
         self.assertNotIn("/dev/infiniband/rdma_cm", rendered)
+        self.assertIn('UCX_RNDV_PIPELINE_ERROR_HANDLING: "${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}"', rendered)
         self.assertIn('UCX_TLS: "${UCX_TLS:-tcp,cuda_copy,cuda_ipc}"', rendered)
         self.assertIn('UCX_MAX_RNDV_RAILS: "${UCX_MAX_RNDV_RAILS:-2}"', rendered)
 

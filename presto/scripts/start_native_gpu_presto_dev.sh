@@ -160,9 +160,9 @@ CUDF DEV TUNING:
     PRESTO_CUDF_AST_EXPRESSION_PRIORITY=<integer>
     PRESTO_CUDF_JIT_EXPRESSION_ENABLED=true|false
     PRESTO_CUDF_MEMORY_RESOURCE=cuda|pool|async|arena|managed|managed_pool|managed_async|prefetch_managed|prefetch_managed_pool|prefetch_managed_async
-    PRESTO_CUDF_PARTITIONED_OUTPUT_BATCH_ROWS=<positive integer rows> (default 100000000)
+    PRESTO_CUDF_PARTITIONED_OUTPUT_BATCH_ROWS=<positive integer rows> (default 10000000)
     PRESTO_CUDF_PARTITIONED_OUTPUT_MAX_BATCH_ROWS=<positive integer rows> (default unset)
-    PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default 100000000)
+    PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default 40000000)
     PRESTO_CUDF_BATCH_SIZE_MAX_THRESHOLD=<positive integer rows> (default unset)
     PRESTO_CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD=<positive integer rows> (default unset)
     VELOX_CUDF_TRIM_ASYNC_POOL_BEFORE_HASH_JOIN=1
@@ -170,7 +170,7 @@ CUDF DEV TUNING:
 UCX DEV TUNING:
     PRESTO_GPU_UCX_TLS=<UCX transport list>
         GPU worker transports. The default is tcp,cuda_copy,cuda_ipc normally
-        and tcp,srd,cuda_copy with --ucx-efa. Falls back to UCX_TLS.
+        and tcp,srd,cuda_copy,self with --ucx-efa. Falls back to UCX_TLS.
     PRESTO_GPU_UCX_MAX_RNDV_RAILS=<positive integer>
         Maximum rendezvous rails. The default is 2 normally and 1 with
         --ucx-efa. Falls back to UCX_MAX_RNDV_RAILS.
@@ -181,7 +181,8 @@ UCX DEV TUNING:
     PRESTO_GPU_UCX_SOCKADDR_TLS_PRIORITY=<UCX transport list>
         EFA connection-manager priority (default: tcp).
     PRESTO_GPU_UCX_RNDV_PIPELINE_ERROR_HANDLING=y|n
-        Rendezvous pipeline error handling (default: y).
+        Rendezvous pipeline error handling. Defaults to y normally and n with
+        --ucx-efa.
 
 GPU NUMA PLACEMENT:
     PRESTO_GPU_NUMA_BINDING=auto|required|off
@@ -236,14 +237,19 @@ function configure_dev_gpu_ucx_environment() {
 
   local default_tls=tcp,cuda_copy,cuda_ipc
   local default_max_rndv_rails=2
+  local default_pipeline_error_handling=y
   if [[ ${UCX_EFA:-false} == true ]]; then
-    default_tls=tcp,srd,cuda_copy
+    # Pure SRD is the measured EFA baseline. Patched CUDA IPC remains available
+    # as an explicit PRESTO_GPU_UCX_TLS experiment rather than being mixed into
+    # every EFA run by default.
+    default_tls=tcp,srd,cuda_copy,self
     default_max_rndv_rails=1
+    default_pipeline_error_handling=n
   fi
 
   local tls="${PRESTO_GPU_UCX_TLS:-${UCX_TLS:-$default_tls}}"
   local max_rndv_rails="${PRESTO_GPU_UCX_MAX_RNDV_RAILS:-${UCX_MAX_RNDV_RAILS:-$default_max_rndv_rails}}"
-  local pipeline_error_handling="${PRESTO_GPU_UCX_RNDV_PIPELINE_ERROR_HANDLING:-${UCX_RNDV_PIPELINE_ERROR_HANDLING:-y}}"
+  local pipeline_error_handling="${PRESTO_GPU_UCX_RNDV_PIPELINE_ERROR_HANDLING:-${UCX_RNDV_PIPELINE_ERROR_HANDLING:-$default_pipeline_error_handling}}"
 
   if [[ -z "$tls" || "$tls" =~ ^[[:space:]]*$ ]]; then
     echo "ERROR: PRESTO_GPU_UCX_TLS must contain at least one UCX transport." >&2
@@ -975,6 +981,24 @@ function apply_dev_discovery_tuning() {
   echo "Dev discovery tuning: discovery.max-age=${discovery_max_age} discovery.store-cache-ttl=${discovery_store_cache_ttl} node-discovery-poll-ms=${node_discovery_poll_ms} failure-expiration-grace=${failure_expiration_grace} worker-announcement-ms=${worker_announcement_ms}"
 }
 
+function apply_dev_ucxx_tuning() {
+  local config_dir="${SCRIPT_DIR}/../docker/config/generated/gpu"
+  local worker_config
+
+  # --skip-generate-config bypasses generate_presto_config.sh. Reconcile these
+  # transport-specific properties here as well so toggling EFA cannot retain
+  # stale UCXX behavior or depend on regenerating the full profile.
+  for worker_config in "${config_dir}"/etc_worker*/config_native.properties; do
+    [[ -f "$worker_config" ]] || continue
+    remove_properties_file_key "ucxx.error_handling" "$worker_config"
+    remove_properties_file_key "ucxx.blocking_polling" "$worker_config"
+    if [[ ${UCX_EFA:-false} == true ]]; then
+      set_properties_file_value "ucxx.error_handling" "false" "$worker_config"
+      set_properties_file_value "ucxx.blocking_polling" "false" "$worker_config"
+    fi
+  done
+}
+
 function apply_dev_cudf_tuning() {
   local config_dir="${SCRIPT_DIR}/../docker/config/generated/gpu"
   local distinct_hash_join_enabled="${PRESTO_CUDF_DISTINCT_HASH_JOIN_ENABLED:-${CUDF_DISTINCT_HASH_JOIN_ENABLED:-}}"
@@ -983,9 +1007,9 @@ function apply_dev_cudf_tuning() {
   local ast_expression_priority="${PRESTO_CUDF_AST_EXPRESSION_PRIORITY:-${CUDF_AST_EXPRESSION_PRIORITY:-}}"
   local jit_expression_enabled="${PRESTO_CUDF_JIT_EXPRESSION_ENABLED:-${CUDF_JIT_EXPRESSION_ENABLED:-}}"
   local memory_resource="${PRESTO_CUDF_MEMORY_RESOURCE:-${CUDF_MEMORY_RESOURCE:-async}}"
-  local partitioned_output_batch_rows="${PRESTO_CUDF_PARTITIONED_OUTPUT_BATCH_ROWS:-${CUDF_PARTITIONED_OUTPUT_BATCH_ROWS:-100000000}}"
+  local partitioned_output_batch_rows="${PRESTO_CUDF_PARTITIONED_OUTPUT_BATCH_ROWS:-${CUDF_PARTITIONED_OUTPUT_BATCH_ROWS:-10000000}}"
   local partitioned_output_max_batch_rows="${PRESTO_CUDF_PARTITIONED_OUTPUT_MAX_BATCH_ROWS:-${CUDF_PARTITIONED_OUTPUT_MAX_BATCH_ROWS:-}}"
-  local batch_size_min_threshold="${PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD:-${CUDF_BATCH_SIZE_MIN_THRESHOLD:-100000000}}"
+  local batch_size_min_threshold="${PRESTO_CUDF_BATCH_SIZE_MIN_THRESHOLD:-${CUDF_BATCH_SIZE_MIN_THRESHOLD:-40000000}}"
   local batch_size_max_threshold="${PRESTO_CUDF_BATCH_SIZE_MAX_THRESHOLD:-${CUDF_BATCH_SIZE_MAX_THRESHOLD:-}}"
   local final_agg_batch_size_min_threshold="${PRESTO_CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD:-${CUDF_FINAL_AGG_BATCH_SIZE_MIN_THRESHOLD:-}}"
   local output_mr="${PRESTO_CUDF_OUTPUT_MR:-${CUDF_OUTPUT_MR:-}}"
@@ -1454,7 +1478,7 @@ apply_gpu_s3_coordinator_config \
 apply_s3_direct_receive_worker_catalogs \
   gpu "${DEV_S3_DIRECT_RECEIVE}" \
   "${SCRIPT_DIR}/../docker/config/generated/gpu" \
-  "${SCRIPT_DIR}/../docker/config/template/etc_worker/catalog/hive.properties" \
+  "${SCRIPT_DIR}/../docker/config/template/overrides/gpu/etc_worker/catalog/hive.properties" \
   "${DEV_GPU_S3_READER_MODE}" \
   "${DEV_S3_ADAPTIVE_TCP_MSS}" \
   "${DEV_S3_AWS_DIRECT_RECEIVE_MODE}"
@@ -1465,6 +1489,7 @@ apply_gpu_worker_memory_and_cache_config \
   "${NUM_WORKERS}" \
   "${GPU_HOST_RAM_GB}"
 apply_dev_node_addresses
+apply_dev_ucxx_tuning
 apply_dev_cudf_tuning
 apply_dev_discovery_tuning
 
