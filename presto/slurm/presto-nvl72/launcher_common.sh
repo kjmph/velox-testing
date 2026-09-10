@@ -13,7 +13,12 @@
 #   resolve_cluster_variant <gpu|cpu>
 #       Reads CLUSTER_{GPU,CPU}_* and populates the generic CLUSTER_DEFAULT_*,
 #       CLUSTER_CPUS_PER_TASK, CLUSTER_NUM_WORKERS_PER_NODE, CLUSTER_TIME_*,
-#       CLUSTER_DEFAULT_PORT, CLUSTER_UCX_NET_DEVICES, CLUSTER_USE_NUMA,
+#       CLUSTER_DEFAULT_PORT, CLUSTER_UCX_NET_DEVICES,
+#       CLUSTER_UCX_NET_DEVICES_BY_LOCAL_WORKER,
+#       CLUSTER_UCX_NET_DEVICES_BY_GPU,
+#       CLUSTER_INTERNAL_ADDRESS_INTERFACE,
+#       CLUSTER_INTERNAL_ADDRESS_INTERFACE_BY_GPU,
+#       CLUSTER_MELLANOX_VISIBLE_DEVICES, CLUSTER_USE_NUMA,
 #       CLUSTER_EXTRA_MOUNTS, CLUSTER_NUMA_GPUS_PER_NODE, CLUSTER_LIB*_PATH
 #       variables, plus COORD_IMAGE / WORKER_IMAGE. Pre-existing values are
 #       preserved (so command-line flags and shell exports still win).
@@ -22,6 +27,19 @@
 #       Sets the global CLUSTER_SBATCH_ARGS array with --cpus-per-task,
 #       --partition, --account, and (if provided non-empty) --time. Caller
 #       passes the array to sbatch.
+#
+#   parse_positive_integer_csv <csv> <output-array-name>
+#       Parse the canonical comma-separated positive-integer syntax used by
+#       launcher sweep options. Returns non-zero without modifying the caller's
+#       array when the input is malformed.
+#
+#   count_idle_slurm_nodes <partition> [<nodelist>]
+#       Print the number of unique nodes whose current long Slurm state is
+#       exactly IDLE, optionally restricted to a nodelist expression.
+#
+#   prompt_yes_no <prompt>
+#       Ask a yes/no question on the controlling terminal. Returns 0 only for
+#       y/yes, 1 for a negative response, and 2 when no terminal is available.
 #
 # Shared defaults:
 #   WORKER_ENV_FILE — path to the env file bind-mounted into worker
@@ -34,6 +52,54 @@ _launcher_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${WORKER_ENV_FILE:=${_launcher_common_dir}/worker.env}"
 : "${VT_ROOT:=$(cd "${_launcher_common_dir}/../../.." && pwd -P)}"
 unset _launcher_common_dir
+
+# ----------------------------------------------------------------------------
+# Launcher input / interaction helpers
+# ----------------------------------------------------------------------------
+
+parse_positive_integer_csv() {
+    local input="$1"
+    local output_name="$2"
+    local -a parsed=()
+
+    [[ "${input}" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || return 1
+    IFS=',' read -r -a parsed <<< "${input}"
+
+    local -n output_ref="${output_name}"
+    output_ref=("${parsed[@]}")
+}
+
+count_idle_slurm_nodes() {
+    local partition="${1:-}"
+    local nodelist="${2:-}"
+    local -a args=(--noheader --Node --states=IDLE '--format=%N|%T')
+    [[ -n "${partition}" ]] && args+=(--partition="${partition}")
+    [[ -n "${nodelist}" ]] && args+=(--nodes="${nodelist}")
+
+    local rows
+    rows="$(sinfo "${args[@]}")" || return 1
+    awk -F'|' '
+        $1 != "" && tolower($2) == "idle" { nodes[$1] = 1 }
+        END { print length(nodes) }
+    ' <<< "${rows}"
+}
+
+prompt_yes_no() {
+    local prompt="$1"
+    local reply=""
+    local tty_fd
+
+    if ! { exec {tty_fd}<>/dev/tty; } 2>/dev/null; then
+        return 2
+    fi
+    printf '%s [y/N] ' "${prompt}" >&"${tty_fd}"
+    if ! IFS= read -r reply <&"${tty_fd}"; then
+        exec {tty_fd}>&-
+        return 1
+    fi
+    exec {tty_fd}>&-
+    [[ "${reply}" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
 
 # ----------------------------------------------------------------------------
 # Pre-flight checks
@@ -57,9 +123,29 @@ _path_is_compute_only() {
     local path="$1" prefix
     [[ -z "${CLUSTER_COMPUTE_ONLY_PATHS:-}" ]] && return 1
     for prefix in ${CLUSTER_COMPUTE_ONLY_PATHS}; do
-        [[ -n "${prefix}" && "${path}" == "${prefix}"* ]] && return 0
+        # Match the prefix itself or a path below it, but not a sibling such as
+        # /scratch-old when the configured prefix is /scratch.
+        prefix="${prefix%/}"
+        [[ -n "${prefix}" && ( "${path}" == "${prefix}" || "${path}" == "${prefix}/"* ) ]] && return 0
     done
     return 1
+}
+
+# canonicalize_file_path <path>
+# Print an absolute path. Existing paths are normalized through their physical
+# parent directory; compute-only paths that are invisible on the login node are
+# made absolute without requiring that parent to exist locally.
+canonicalize_file_path() {
+    local path="$1" parent base
+    if [[ "${path}" != /* ]]; then
+        path="${PWD}/${path}"
+    fi
+    parent="$(dirname -- "${path}")"
+    base="$(basename -- "${path}")"
+    if [[ -d "${parent}" ]]; then
+        parent="$(cd -- "${parent}" && pwd -P)"
+    fi
+    printf '%s/%s\n' "${parent%/}" "${base}"
 }
 
 # preflight_image <image_name_or_path> [<hint>]
@@ -86,6 +172,22 @@ preflight_image() {
     fi
 }
 
+# preflight_image_roles <worker_image> <coordinator_image>
+# Catch the common -w/-c transposition before consuming a Slurm allocation.
+# This is deliberately a narrow name-based check: generated images in this
+# repository contain "coordinator" only in the Java coordinator artifact.
+preflight_image_roles() {
+    local worker_image="$1" coord_image="$2"
+    local worker_lower="${worker_image,,}" coord_lower="${coord_image,,}"
+    if [[ "${worker_lower}" == *coordinator* && "${coord_lower}" != *coordinator* ]]; then
+        echo "Error: worker and coordinator images appear to be reversed." >&2
+        echo "       -w/--worker-image: ${worker_image}" >&2
+        echo "       -c/--coord-image:  ${coord_image}" >&2
+        echo "       Pass the *-coordinator-* image to -c and the *-cpu-* or *-gpu-* image to -w." >&2
+        exit 1
+    fi
+}
+
 # preflight_dir <path> <description> [<hint>]
 # Verify a directory exists. <description> is used in the error message.
 preflight_dir() {
@@ -101,6 +203,26 @@ preflight_dir() {
     fi
     if [[ ! -d "${path}" ]]; then
         echo "Error: ${desc} directory not found at ${path}" >&2
+        [[ -n "${hint}" ]] && echo "       To fix:  ${hint}" >&2
+        exit 1
+    fi
+}
+
+# preflight_file <path> <description> [<hint>]
+# Verify a regular file exists. <description> is used in the error message.
+preflight_file() {
+    local path="$1" desc="$2" hint="${3:-}"
+    if [[ -z "${path}" ]]; then
+        echo "Error: ${desc} path is not set" >&2
+        [[ -n "${hint}" ]] && echo "       To fix:  ${hint}" >&2
+        exit 1
+    fi
+    if _path_is_compute_only "${path}"; then
+        echo "Note: skipping host-side preflight for ${desc} at ${path} (compute-only path)" >&2
+        return 0
+    fi
+    if [[ ! -f "${path}" ]]; then
+        echo "Error: ${desc} file not found at ${path}" >&2
         [[ -n "${hint}" ]] && echo "       To fix:  ${hint}" >&2
         exit 1
     fi
@@ -269,6 +391,11 @@ resolve_cluster_variant() {
     _resolve_var CLUSTER_TIME_ANALYZE         "${prefix}_TIME_ANALYZE"
     _resolve_var CLUSTER_DEFAULT_PORT         "${prefix}_DEFAULT_PORT"
     _resolve_var CLUSTER_UCX_NET_DEVICES      "${prefix}_UCX_NET_DEVICES"
+    _resolve_var CLUSTER_UCX_NET_DEVICES_BY_LOCAL_WORKER "${prefix}_UCX_NET_DEVICES_BY_LOCAL_WORKER"
+    _resolve_var CLUSTER_UCX_NET_DEVICES_BY_GPU "${prefix}_UCX_NET_DEVICES_BY_GPU"
+    _resolve_var CLUSTER_INTERNAL_ADDRESS_INTERFACE "${prefix}_INTERNAL_ADDRESS_INTERFACE"
+    _resolve_var CLUSTER_INTERNAL_ADDRESS_INTERFACE_BY_GPU "${prefix}_INTERNAL_ADDRESS_INTERFACE_BY_GPU"
+    _resolve_var CLUSTER_MELLANOX_VISIBLE_DEVICES "${prefix}_MELLANOX_VISIBLE_DEVICES"
     _resolve_var CLUSTER_EXTRA_MOUNTS         "${prefix}_EXTRA_MOUNTS"
     _resolve_var COORD_IMAGE                  "${prefix}_DEFAULT_COORD_IMAGE"
     _resolve_var WORKER_IMAGE                 "${prefix}_DEFAULT_WORKER_IMAGE"
@@ -297,16 +424,30 @@ build_common_export_vars() {
     EXPORT_VARS="ALL,SCALE_FACTOR=${SCALE_FACTOR},SCRIPT_DIR=${SCRIPT_DIR}"
     EXPORT_VARS+=",NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE},WORKER_IMAGE=${WORKER_IMAGE},COORD_IMAGE=${COORD_IMAGE}"
     EXPORT_VARS+=",USE_NUMA=${USE_NUMA},VARIANT_TYPE=${VARIANT_TYPE}"
+    EXPORT_VARS+=",LEGACY_CPU_NUMA=${LEGACY_CPU_NUMA:-0}"
     EXPORT_VARS+=",WORKER_ENV_FILE=${WORKER_ENV_FILE}"
     EXPORT_VARS+=",CLUSTER_DEFAULT_PORT=${CLUSTER_DEFAULT_PORT}"
     local v
-    for v in CLUSTER_UCX_NET_DEVICES CLUSTER_NUMA_GPUS_PER_NODE \
+    for v in CLUSTER_INTERNAL_ADDRESS_INTERFACE \
+             CLUSTER_MELLANOX_VISIBLE_DEVICES CLUSTER_NUMA_GPUS_PER_NODE \
              CLUSTER_LIBCUDA_HOST_PATH CLUSTER_LIBCUDA_CONTAINER_PATH \
              CLUSTER_LIBNVIDIA_ML_HOST_PATH CLUSTER_LIBNVIDIA_ML_CONTAINER_PATH \
-             CLUSTER_EXTRA_MOUNTS CLUSTER_CONFIG \
+             CLUSTER_CONFIG \
              HIVE_METASTORE_VERSION HIVE_METASTORE_SHARED_ROOT; do
         [[ -n "${!v:-}" ]] && EXPORT_VARS+=",${v}=${!v}"
     done
+    # Values in these variables may contain commas (rail lists/mount lists), so
+    # they cannot be embedded directly in sbatch's comma-delimited --export
+    # argument. Export them into the caller and let the leading ALL carry each
+    # value without re-tokenizing it.
+    for v in CLUSTER_UCX_NET_DEVICES \
+             CLUSTER_UCX_NET_DEVICES_BY_LOCAL_WORKER \
+             CLUSTER_UCX_NET_DEVICES_BY_GPU CLUSTER_EXTRA_MOUNTS \
+             CLUSTER_INTERNAL_ADDRESS_INTERFACE_BY_GPU \
+             PRESTO_INTERNAL_ADDRESS_INTERFACE_BY_GPU; do
+        [[ -n "${!v:-}" ]] && export "${v}"
+    done
+    return 0
 }
 
 build_cluster_sbatch_args() {

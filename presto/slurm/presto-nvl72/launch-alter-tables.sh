@@ -133,6 +133,9 @@ mkdir -p logs
 SCRIPT_DIR="$PWD"
 
 build_common_export_vars
+# Dedicated coordinators are benchmark-only. Pin this explicitly so an
+# inherited shell variable cannot remove the alter worker from its node.
+EXPORT_VARS+=",DEDICATED_COORDINATOR=0"
 # ALTER_SQL_FILE has no commas, so riding EXPORT_VARS directly is safe.
 EXPORT_VARS+=",ALTER_SQL_FILE=${SQL_FILE}"
 

@@ -16,6 +16,7 @@
 #                              [-d|--data-dir <path>]
 #                              [-g|--num-workers-per-node <n>]
 #                              [-w|--worker-image <name>] [-c|--coord-image <name>]
+#                              [--worker-env-file <path>]
 #                              [additional sbatch options]
 #
 # Examples:
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         -g|--num-workers-per-node) requires_value "$1" "${2:-}"; NUM_GPUS_PER_NODE="$2"; shift 2 ;;
         -w|--worker-image)         requires_value "$1" "${2:-}"; WORKER_IMAGE="$2"; shift 2 ;;
         -c|--coord-image)          requires_value "$1" "${2:-}"; COORD_IMAGE="$2"; shift 2 ;;
+        --worker-env-file)         requires_value "$1" "${2:-}"; WORKER_ENV_FILE="$2"; shift 2 ;;
         --) shift; break ;;
         *) EXTRA_ARGS+=("$1"); shift ;;
     esac
@@ -79,6 +81,10 @@ resolve_cluster_variant cpu
 build_cluster_sbatch_args "${CLUSTER_TIME_ANALYZE}"
 
 # Pre-flight: verify prerequisites before queueing the job.
+preflight_file "${WORKER_ENV_FILE}" "worker environment" \
+    "Set WORKER_ENV_FILE or pass --worker-env-file <path>"
+WORKER_ENV_FILE="$(canonicalize_file_path "${WORKER_ENV_FILE}")"
+preflight_image_roles "${WORKER_IMAGE}" "${COORD_IMAGE}"
 preflight_image "${WORKER_IMAGE}" \
     "Pull it (see ./pull_ghcr_image.sh) or override with -w <name>"
 preflight_image "${COORD_IMAGE}" \
@@ -93,6 +99,9 @@ mkdir -p logs
 SCRIPT_DIR="$PWD"
 
 build_common_export_vars
+# Dedicated coordinators are benchmark-only. Pin this explicitly so an
+# inherited shell variable cannot remove the analyze worker from its node.
+EXPORT_VARS+=",DEDICATED_COORDINATOR=0"
 [[ -n "${DATA_DIR}" ]] && EXPORT_VARS+=",DATA=${DATA_DIR}"
 # Forward DATASET_NAME explicitly. The slurm wrapper has `:= tpch-rs-${SF}`
 # as the default, so relying on `--export=ALL` inheritance is too fragile when
