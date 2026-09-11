@@ -174,6 +174,13 @@ fi
   fail 'GPU buffered-cache auto mode did not enable adaptive TCP MSS'
 [[ $(resolve_s3_adaptive_tcp_mss_enabled gpu true kvikio auto) == false ]] ||
   fail 'GPU KvikIO auto mode unexpectedly enabled the AWS SDK policy'
+[[ $(normalize_gpu_s3_reader_mode KVIKIO-CACHE) == kvikio-cache ]] ||
+  fail 'KvikIO cache mode was not normalized'
+[[ $(resolve_s3_adaptive_tcp_mss_enabled gpu true kvikio-cache auto) == false ]] ||
+  fail 'GPU KvikIO cache mode unexpectedly enabled the AWS SDK policy'
+if resolve_s3_adaptive_tcp_mss_enabled gpu true kvikio-cache on >/dev/null 2>&1; then
+  fail 'adaptive TCP MSS on mode was accepted for cached KvikIO'
+fi
 [[ $(resolve_s3_adaptive_tcp_mss_enabled cpu true buffered off) == false ]] ||
   fail 'adaptive TCP MSS off mode was ignored'
 if resolve_s3_adaptive_tcp_mss_enabled gpu true kvikio on >/dev/null 2>&1; then
@@ -444,6 +451,15 @@ for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
 done
 
 apply_s3_direct_receive_worker_catalogs \
+  gpu true "${CONFIG_ROOT}" "${BASELINE}" kvikio-cache
+for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
+  [[ $(grep -c '^cudf.hive.use-buffered-input=false$' "${file}") -eq 1 ]] ||
+    fail "cached KvikIO did not select the KvikIO reader in ${file}"
+  assert_not_contains 'hive.s3.direct-receive-mode=' "${file}"
+  assert_not_contains 'hive.s3.adaptive-tcp-mss-enabled=' "${file}"
+done
+
+apply_s3_direct_receive_worker_catalogs \
   gpu true "${CONFIG_ROOT}" "${BASELINE}" buffered-cache
 for file in "${CONFIG_ROOT}"/etc_worker*/catalog/hive.properties; do
   assert_contains 'cudf.hive.use-buffered-input=true' "${file}"
@@ -535,6 +551,26 @@ assert_contains 'cache=true' <(printf '%s\n' "${memory_summary}")
 for file in "${CONFIG_ROOT}"/etc_worker*/config_native.properties; do
   [[ $(grep -c '^async-data-cache-enabled=true$' "${file}") -eq 1 ]] ||
     fail "GPU buffered-cache mode did not enable the async cache in ${file}"
+done
+
+memory_summary=$(apply_gpu_worker_memory_and_cache_config \
+  kvikio-cache "${CONFIG_ROOT}" 8 2032)
+assert_contains 'cache=true' <(printf '%s\n' "${memory_summary}")
+for file in "${CONFIG_ROOT}"/etc_worker*/config_native.properties; do
+  assert_contains 'async-data-cache-enabled=true' "${file}"
+  assert_contains 'system-mem-limit-gb=229' "${file}"
+done
+[[ $(gpu_s3_node_selection_strategy true kvikio-cache "${COORDINATOR_BASELINE}") == SOFT_AFFINITY ]] ||
+  fail 'cached KvikIO did not enable soft affinity'
+[[ $(gpu_s3_restart_target_for_coordinator_state \
+  worker true kvikio-cache "${COORDINATOR_BASELINE}" SOFT_AFFINITY) == worker ]] ||
+  fail 'switching between cache readers unnecessarily restarted the coordinator'
+[[ $(gpu_s3_restart_target_for_coordinator_state \
+  worker true kvikio-cache "${COORDINATOR_BASELINE}" NO_PREFERENCE) == all ]] ||
+  fail 'entering cached KvikIO did not reconcile the coordinator'
+apply_gpu_worker_memory_and_cache_config kvikio "${CONFIG_ROOT}" 8 2032 >/dev/null
+for file in "${CONFIG_ROOT}"/etc_worker*/config_native.properties; do
+  assert_contains 'async-data-cache-enabled=false' "${file}"
 done
 
 export GPU_HOST_RESERVE_GB=200
@@ -777,6 +813,10 @@ assert_launcher_rejects_aws_direct_receive_mode \
   "${GPU_LAUNCHER}" \
   'S3 AWS direct-receive mode applies only to --s3-reader-mode buffered or buffered-cache' \
   --s3-aws-direct-receive-mode required
+assert_launcher_rejects_aws_direct_receive_mode \
+  "${GPU_LAUNCHER}" \
+  'S3 AWS direct-receive mode applies only to --s3-reader-mode buffered or buffered-cache' \
+  --s3-reader-mode kvikio-cache --s3-aws-direct-receive-mode required
 # Existing versioned worker images must remain reusable without an explicit
 # worker build target.
 # shellcheck disable=SC2016

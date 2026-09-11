@@ -96,12 +96,15 @@ DEV_OPTIONS:
         Defaults KvikIO to MULTI_POLL, strict direct receive, 16 MiB tasks,
         64 concurrent requests, four reactors, and PER_CHUNK dispatch. Set the
         corresponding KVIKIO_* environment variable to override any value.
-    --s3-reader-mode kvikio|buffered|buffered-cache
+    --s3-reader-mode kvikio|kvikio-cache|buffered|buffered-cache
         Select the GPU reader while retaining the isolated direct-receive
         dependency chain. "kvikio" receives through KvikIO without the Velox
         host cache. "buffered" receives through Velox/AWS SDK caller buffers
         without caching. "buffered-cache" adds Velox AsyncDataCache and stable
-        soft-affinity placement. Entering or leaving buffered-cache may widen a
+        soft-affinity placement. "kvikio-cache" uses KvikIO cache fills through
+        the optional CachingDataSource (requires a worker built with that feature).
+        Both cache modes use the same host-memory budget and soft affinity.
+        Entering or leaving a cache-enabled mode may widen a
         worker-only restart to include the coordinator. Supplying this option
         implies --s3-direct-receive. Can also be set with
         PRESTO_DEV_GPU_S3_READER_MODE when direct receive is enabled.
@@ -406,8 +409,8 @@ if ! DEV_S3_AWS_DIRECT_RECEIVE_MODE="$(
 )"; then
   exit 1
 fi
-if [[ ${DEV_S3_AWS_DIRECT_RECEIVE_MODE_EXPLICIT} == true &&
-      ${DEV_GPU_S3_READER_MODE} == kvikio ]]; then
+if [[ ${DEV_S3_AWS_DIRECT_RECEIVE_MODE_EXPLICIT} == true ]] &&
+    gpu_s3_reader_uses_kvikio "${DEV_GPU_S3_READER_MODE}"; then
   echo "ERROR: S3 AWS direct-receive mode applies only to --s3-reader-mode buffered or buffered-cache." >&2
   exit 1
 fi
@@ -417,7 +420,7 @@ if ! DEV_S3_ADAPTIVE_TCP_MSS="$(
   exit 1
 fi
 if [[ ${DEV_S3_DIRECT_RECEIVE} != true && ${DEV_GPU_S3_READER_MODE} != kvikio ]]; then
-  echo "ERROR: buffered GPU S3 reader modes require --s3-direct-receive." >&2
+  echo "ERROR: non-default GPU S3 reader modes require --s3-direct-receive." >&2
   exit 1
 fi
 if ! S3_ADAPTIVE_TCP_MSS_ENABLED="$(
@@ -607,7 +610,7 @@ GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}${PRESTO_GPU_WORKER_I
 if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
   DEPS_IMAGE="${S3_DIRECT_DEPS_IMAGE:-$(derive_s3_direct_dependency_image_name "${ORDINARY_DEPS_IMAGE}")}"
   GPU_WORKER_IMAGE="${GPU_WORKER_SERVICE}:${PRESTO_IMAGE_TAG}${PRESTO_GPU_WORKER_IMAGE_TAG_SUFFIX}-s3-direct"
-  if [[ ${DEV_GPU_S3_READER_MODE} == kvikio ]]; then
+  if gpu_s3_reader_uses_kvikio "${DEV_GPU_S3_READER_MODE}"; then
     apply_s3_direct_receive_kvikio_defaults
   fi
 fi
@@ -1539,13 +1542,13 @@ if [[ ${DEV_S3_DIRECT_RECEIVE} == true ]]; then
     "${S3_DIRECT_CREDENTIAL_SOURCE}" \
     "${S3_DIRECT_WORKER_SERVICES[@]}"
   COMPOSE_FILE_ARGS+=(-f "$S3_DIRECT_OVERRIDE_PATH")
-  if [[ ${DEV_GPU_S3_READER_MODE} == kvikio ]]; then
+  if gpu_s3_reader_uses_kvikio "${DEV_GPU_S3_READER_MODE}"; then
     GPU_S3_AWS_DIRECT_RECEIVE_MODE=n/a
   else
     GPU_S3_AWS_DIRECT_RECEIVE_MODE=${DEV_S3_AWS_DIRECT_RECEIVE_MODE}
   fi
   echo "S3 direct receive enabled for GPU workers (${DEPS_IMAGE}); reader=${DEV_GPU_S3_READER_MODE}; aws-mode=${GPU_S3_AWS_DIRECT_RECEIVE_MODE}; adaptive-tcp-mss=${DEV_S3_ADAPTIVE_TCP_MSS}/${S3_ADAPTIVE_TCP_MSS_ENABLED}"
-  if [[ ${DEV_GPU_S3_READER_MODE} == kvikio ]]; then
+  if gpu_s3_reader_uses_kvikio "${DEV_GPU_S3_READER_MODE}"; then
     printf 'KvikIO S3 tuning: backend=%s direct-receive=%s task-size=%s max-concurrent-requests=%s reactors=%s dispatch=%s\n' \
       "${KVIKIO_REMOTE_IO_BACKEND}" \
       "${KVIKIO_REMOTE_DIRECT_RECEIVE}" \

@@ -49,14 +49,22 @@ function normalize_gpu_s3_reader_mode() {
   local mode=${1,,}
 
   case ${mode} in
-    kvikio|buffered|buffered-cache)
+    kvikio|kvikio-cache|buffered|buffered-cache)
       printf '%s\n' "${mode}"
       ;;
     *)
-      echo "ERROR: GPU S3 reader mode must be kvikio, buffered, or buffered-cache; got '${1}'." >&2
+      echo "ERROR: GPU S3 reader mode must be kvikio, kvikio-cache, buffered, or buffered-cache; got '${1}'." >&2
       return 1
       ;;
   esac
+}
+
+function gpu_s3_reader_uses_kvikio() {
+  [[ ${1} == kvikio || ${1} == kvikio-cache ]]
+}
+
+function gpu_s3_reader_uses_cache() {
+  [[ ${1} == buffered-cache || ${1} == kvikio-cache ]]
 }
 
 function normalize_s3_aws_direct_receive_mode() {
@@ -100,8 +108,8 @@ function resolve_s3_adaptive_tcp_mss_enabled() {
       printf '%s\n' false
       ;;
     auto)
-      if [[ ${direct_receive_enabled} == true &&
-            (${variant} == cpu || ${gpu_reader_mode} != kvikio) ]]; then
+      if [[ ${direct_receive_enabled} == true ]] &&
+          { [[ ${variant} == cpu ]] || ! gpu_s3_reader_uses_kvikio "${gpu_reader_mode}"; }; then
         printf '%s\n' true
       else
         printf '%s\n' false
@@ -112,7 +120,7 @@ function resolve_s3_adaptive_tcp_mss_enabled() {
         echo "ERROR: adaptive TCP MSS mode 'on' requires --s3-direct-receive." >&2
         return 1
       fi
-      if [[ ${variant} == gpu && ${gpu_reader_mode} == kvikio ]]; then
+      if [[ ${variant} == gpu ]] && gpu_s3_reader_uses_kvikio "${gpu_reader_mode}"; then
         echo "ERROR: adaptive TCP MSS mode 'on' requires a buffered GPU S3 reader; KvikIO does not use the AWS SDK curl connection pool." >&2
         return 1
       fi
@@ -269,7 +277,7 @@ function gpu_s3_node_selection_strategy() {
     reader_mode=$(normalize_gpu_s3_reader_mode "${reader_mode}") || return 1
   fi
 
-  if [[ ${enabled} == true && ${reader_mode} == buffered-cache ]]; then
+  if [[ ${enabled} == true ]] && gpu_s3_reader_uses_cache "${reader_mode}"; then
     printf '%s\n' SOFT_AFFINITY
     return 0
   fi
@@ -420,7 +428,8 @@ function apply_s3_direct_receive_worker_catalogs() {
       set_properties_file_value_exact \
         "hive.s3.direct-receive-mode" "${direct_receive_mode}" "${hive_config}"
     fi
-    if [[ ${enabled} == true && ${variant} == gpu && ${gpu_reader_mode} == kvikio ]]; then
+    if [[ ${enabled} == true && ${variant} == gpu ]] &&
+        gpu_s3_reader_uses_kvikio "${gpu_reader_mode}"; then
       set_properties_file_value_exact \
         "cudf.hive.use-buffered-input" "false" "${hive_config}"
     elif [[ ${enabled} == true && ${variant} == gpu ]]; then
@@ -460,7 +469,7 @@ function apply_gpu_worker_memory_and_cache_config() {
   local cfg
 
   reader_mode=$(normalize_gpu_s3_reader_mode "${reader_mode}") || return 1
-  if [[ ${reader_mode} == buffered-cache ]]; then
+  if gpu_s3_reader_uses_cache "${reader_mode}"; then
     cache_enabled=true
   fi
 
