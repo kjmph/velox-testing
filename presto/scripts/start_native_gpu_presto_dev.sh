@@ -29,6 +29,8 @@ DEV_S3_AWS_DIRECT_RECEIVE_MODE="${PRESTO_DEV_S3_AWS_DIRECT_RECEIVE_MODE:-require
 DEV_S3_CREDENTIAL_SOURCE="${PRESTO_DEV_S3_CREDENTIAL_SOURCE:-auto}"
 DEV_GPU_S3_READER_MODE="${PRESTO_DEV_GPU_S3_READER_MODE:-kvikio}"
 DEV_S3_ADAPTIVE_TCP_MSS="${PRESTO_DEV_S3_ADAPTIVE_TCP_MSS:-auto}"
+DEV_CACHE_HOST_REGISTRATION_ENABLED=""
+DEV_CACHE_HOST_REGISTRATION_MAX_BYTES=34359738368
 DEV_ARGS=()
 
 print_dev_help() {
@@ -130,6 +132,11 @@ DEV_OPTIONS:
         not KvikIO, which has a separate curl pool. On requires a buffered
         direct-receive reader; off provides an explicit control experiment.
         Can also be set with PRESTO_DEV_S3_ADAPTIVE_TCP_MSS.
+    --cache-host-registration on|off
+        Register resident cache ranges for direct H2D (default off). Requires
+        the cache-registration worker patch; works with either cached reader.
+    --cache-host-registration-max-bytes N
+        Per-process registration limit (default 34359738368 = 32 GiB).
 
 START_OPTIONS:
     Accepts the same GPU options as start_native_gpu_presto.sh, including:
@@ -370,6 +377,20 @@ while [[ $# -gt 0 ]]; do
       ;;
     --s3-adaptive-tcp-mss)
       DEV_S3_ADAPTIVE_TCP_MSS=${2:?Error: --s3-adaptive-tcp-mss requires a value}
+      shift 2
+      ;;
+    --cache-host-registration)
+      DEV_CACHE_HOST_REGISTRATION_ENABLED=$(normalize_dev_bool \
+        "${2:?Error: --cache-host-registration requires on or off}" \
+        '--cache-host-registration') || exit 1
+      shift 2
+      ;;
+    --cache-host-registration-max-bytes)
+      DEV_CACHE_HOST_REGISTRATION_MAX_BYTES=${2:?Error: --cache-host-registration-max-bytes requires a value}
+      if [[ ! ${DEV_CACHE_HOST_REGISTRATION_MAX_BYTES} =~ ^[1-9][0-9]*$ ]]; then
+        echo 'ERROR: --cache-host-registration-max-bytes must be a positive decimal integer.' >&2
+        exit 1
+      fi
       shift 2
       ;;
     *)
@@ -1124,6 +1145,13 @@ function apply_dev_cudf_tuning() {
     else
       remove_properties_file_key "cudf.final_aggregation_batch_size_min_threshold" "$worker_config"
     fi
+    if [[ -n "$DEV_CACHE_HOST_REGISTRATION_ENABLED" ]]; then
+      set_properties_file_value "cudf.cache_host_registration_enabled" "$DEV_CACHE_HOST_REGISTRATION_ENABLED" "$worker_config"
+      set_properties_file_value "cudf.cache_host_registration_max_bytes" "$DEV_CACHE_HOST_REGISTRATION_MAX_BYTES" "$worker_config"
+    else
+      remove_properties_file_key "cudf.cache_host_registration_enabled" "$worker_config"
+      remove_properties_file_key "cudf.cache_host_registration_max_bytes" "$worker_config"
+    fi
     if [[ -n "$output_mr" ]]; then
       set_properties_file_value "cudf.output_mr" "$output_mr" "$worker_config"
     else
@@ -1139,6 +1167,8 @@ function apply_dev_cudf_tuning() {
   message="${message} cudf.ast_expression_priority=${ast_expression_priority:-<default>}"
   message="${message} cudf.jit_expression_enabled=${jit_expression_enabled:-<default>}"
   message="${message} cudf.memory_resource=${memory_resource}"
+  message="${message} cudf.cache_host_registration_enabled=${DEV_CACHE_HOST_REGISTRATION_ENABLED:-false}"
+  message="${message} cudf.cache_host_registration_max_bytes=${DEV_CACHE_HOST_REGISTRATION_MAX_BYTES}"
   message="${message} cudf.partitioned_output_batch_rows=${partitioned_output_batch_rows}"
   message="${message} cudf.partitioned_output_max_batch_rows=${partitioned_output_max_batch_rows:-<unset>}"
   message="${message} cudf.batch_size_min_threshold=${batch_size_min_threshold}"
