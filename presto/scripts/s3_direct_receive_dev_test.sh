@@ -823,6 +823,8 @@ assert_launcher_rejects_aws_direct_receive_mode \
 assert_contains 'conditionally_add_build_target "$GPU_WORKER_IMAGE"' "${GPU_LAUNCHER}"
 # shellcheck disable=SC2016
 assert_not_contains '! build_targets_include_gpu_worker' "${GPU_LAUNCHER}"
+assert_not_contains '--ucx-source requires a GPU worker build target' "${GPU_LAUNCHER}"
+assert_contains 'specifying this source does not force a rebuild' "${GPU_LAUNCHER}"
 assert_contains 'apply_gpu_worker_memory_and_cache_config' "${GPU_LAUNCHER}"
 assert_contains 'apply_gpu_s3_coordinator_config' "${GPU_LAUNCHER}"
 assert_contains 'reconcile_gpu_s3_coordinator_restart_target' "${GPU_LAUNCHER}"

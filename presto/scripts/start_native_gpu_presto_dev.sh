@@ -72,6 +72,8 @@ DEV_OPTIONS:
     --ucx-source PATH
         Rebuild the local Presto dependency image from this UCX source tree
         before building GPU workers. Can also be set with PRESTO_DEV_UCX_SOURCE.
+        Without a worker build, reuse the existing image and its recorded UCX
+        provenance; specifying this source does not force a rebuild.
     --ucx-version X.Y.Z
         Version expected from --ucx-source (default: 1.22.0). The dependency
         and worker images verify both this value and the exact source hash.
@@ -556,11 +558,6 @@ source "${SCRIPT_DIR}/ucx_source_helpers.sh"
 
 PRESTO_EXPECTED_UCX_VERSION=''
 PRESTO_EXPECTED_UCX_SOURCE_HASH=''
-if [[ -n ${DEV_UCX_SOURCE} ]]; then
-  PRESTO_EXPECTED_UCX_VERSION=${DEV_UCX_VERSION}
-  PRESTO_EXPECTED_UCX_SOURCE_HASH=$(compute_ucx_source_hash "${DEV_UCX_SOURCE}")
-  export PRESTO_EXPECTED_UCX_VERSION PRESTO_EXPECTED_UCX_SOURCE_HASH
-fi
 
 function load_ucx_dependency_provenance() {
   local image=$1
@@ -1474,13 +1471,6 @@ if [[ -n "$NUM_WORKERS" && "$NUM_WORKERS" -gt 1 && "$SINGLE_CONTAINER" == "false
   GPU_WORKER_SERVICE="presto-native-worker-gpu-${FIRST_GPU_ID}"
 fi
 conditionally_add_build_target "$GPU_WORKER_IMAGE" "$GPU_WORKER_SERVICE" "worker|w"
-if [[ -n ${DEV_UCX_SOURCE} ]]; then
-  build_targets_include_gpu_worker || {
-    echo "ERROR: --ucx-source requires a GPU worker build target." >&2
-    echo "Use -b worker (or remove --ucx-source to restart the already-built image)." >&2
-    exit 1
-  }
-fi
 
 LOGS_DIR="${LOGS_DIR:-${SCRIPT_DIR}/presto_logs}"
 if [[ "$DEV_RESTART_TARGET" == "all" || "$DEV_CLEAN_FIRST" == "true" ]]; then
@@ -1635,6 +1625,11 @@ if (( ${#BUILD_TARGET_ARG[@]} )); then
 
   if build_targets_include_gpu_worker &&
     [[ -n "$DEV_UCX_SOURCE" || -n "$DEV_CUDA_VERSION" ]]; then
+    if [[ -n "$DEV_UCX_SOURCE" ]]; then
+      PRESTO_EXPECTED_UCX_VERSION=${DEV_UCX_VERSION}
+      PRESTO_EXPECTED_UCX_SOURCE_HASH=$(compute_ucx_source_hash "${DEV_UCX_SOURCE}")
+      export PRESTO_EXPECTED_UCX_VERSION PRESTO_EXPECTED_UCX_SOURCE_HASH
+    fi
     DEPS_BUILD_ARGS=(
       --image-name "$ORDINARY_DEPS_IMAGE"
       --presto-source "$(effective_presto_source)"
