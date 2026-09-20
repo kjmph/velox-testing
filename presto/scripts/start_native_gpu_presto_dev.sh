@@ -43,6 +43,12 @@ Draft GPU developer start script. It keeps orchestration Python dependencies in
 stop_presto.sh first.
 
 DEV_OPTIONS:
+    --wait
+        Wait for healthy worker HTTP endpoints and the expected coordinator
+        ACTIVE worker count on two consecutive polls, 5 seconds apart.
+        Retained discovery records alone do not satisfy readiness.
+    --wait-timeout SECONDS
+        Bound the complete readiness wait. Default: 120 seconds.
     --restart-target all|coordinator|worker|none
         Which service set to recreate after any build. Default: all.
         "all" is bootstrap/recovery. Use "worker" after native GPU worker code
@@ -1807,12 +1813,18 @@ for line in os.environ["EXPECTED_WORKER_ENDPOINTS"].splitlines():
     valid_urls.update(alternatives)
     worker_ports.add(port)
 
+http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 try:
-    with urllib.request.urlopen("http://localhost:8080/v1/node", timeout=3) as response:
+    with http.open("http://localhost:8080/v1/node", timeout=3) as response:
         nodes = json.load(response)
+    for worker_id, service, alternatives in expected:
+        with http.open(alternatives[0] + "/v1/info/state", timeout=3) as response:
+            state = json.load(response)
+        if state != "ACTIVE":
+            raise ValueError(f"GPU worker {worker_id} ({service}) is {state!r}, not ACTIVE")
 except Exception as error:
     if not quiet:
-        print(f"ERROR: unable to read coordinator node view: {error}", file=sys.stderr)
+        print(f"ERROR: worker readiness check failed: {error}", file=sys.stderr)
     sys.exit(1)
 
 node_text = json.dumps(nodes, sort_keys=True)
@@ -1891,10 +1903,12 @@ case "$DEV_RESTART_TARGET" in
 esac
 
 if [[ "$WAIT_FOR_WORKERS" == "true" ]]; then
-  echo "Waiting for ${NUM_WORKERS} GPU worker(s) to register with coordinator (timeout: ${WAIT_FOR_WORKERS_TIMEOUT}s)..."
+  expected_workers=$(gpu_expected_worker_entries | awk 'END { print NR }')
+  echo "Waiting for ${expected_workers} GPU worker(s) to become healthy and coordinator-ACTIVE (timeout: ${WAIT_FOR_WORKERS_TIMEOUT}s)..."
   deadline=$(( $(date +%s) + WAIT_FOR_WORKERS_TIMEOUT ))
   workers=0
   endpoints_ready=false
+  ready_checks=0
   while [[ $(date +%s) -lt $deadline ]]; do
     fail_if_gpu_workers_exited
     workers=$(python3 - <<'PY'
@@ -1902,27 +1916,35 @@ import json
 import urllib.request
 
 try:
-    with urllib.request.urlopen("http://localhost:8080/v1/node", timeout=1) as r:
-        print(len(json.load(r)))
+    # The native coordinator template sets node-scheduler.include-coordinator=false.
+    # /v1/node counts retained registrations, not scheduler-ACTIVE workers.
+    http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with http.open("http://localhost:8080/v1/cluster?includeLocalInfoOnly=true", timeout=1) as r:
+        count = json.load(r).get("activeWorkers")
+        print(count if type(count) is int and count >= 0 else 0)
 except Exception:
     print(0)
 PY
 )
-    echo "  ${workers}/${NUM_WORKERS} worker(s) registered"
-    if [[ "$workers" -ge "$NUM_WORKERS" ]]; then
-      if verify_gpu_worker_endpoints true; then
+    echo "  ${workers}/${expected_workers} worker(s) ACTIVE at coordinator"
+    if [[ "$workers" -eq "$expected_workers" ]] && verify_gpu_worker_endpoints true; then
+      ready_checks=$((ready_checks + 1))
+      if [[ "$ready_checks" -ge 2 && $(date +%s) -lt "$deadline" ]]; then
         endpoints_ready=true
         break
       fi
-      echo "  worker count is sufficient, but coordinator still has stale GPU worker endpoints"
+      echo "  all worker endpoints healthy; confirming on the next poll"
+    else
+      ready_checks=0
     fi
     sleep 5
   done
-  if [[ "$workers" -lt "$NUM_WORKERS" ]]; then
-    echo "ERROR: only ${workers}/${NUM_WORKERS} workers registered after ${WAIT_FOR_WORKERS_TIMEOUT}s" >&2
+  if [[ "$workers" -ne "$expected_workers" ]]; then
+    echo "ERROR: ${workers}/${expected_workers} workers ACTIVE at coordinator after ${WAIT_FOR_WORKERS_TIMEOUT}s" >&2
     exit 1
   fi
   if [[ "$endpoints_ready" != "true" ]]; then
+    echo "ERROR: worker endpoints did not stay ready for two consecutive polls within ${WAIT_FOR_WORKERS_TIMEOUT}s." >&2
     verify_gpu_worker_endpoints
     exit 1
   fi
