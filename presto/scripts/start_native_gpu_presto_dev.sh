@@ -97,8 +97,8 @@ DEV_OPTIONS:
         receive. Can also be set
         with PRESTO_DEV_S3_DIRECT_RECEIVE=true. The ordinary dependency image,
         worker image, and native object cache remain untouched.
-        Defaults KvikIO to MULTI_POLL, strict direct receive, 16 MiB tasks,
-        64 concurrent requests, four reactors, and PER_CHUNK dispatch. Set the
+        Defaults KvikIO to MULTI_POLL, strict direct receive, 32 MiB tasks,
+        128 concurrent requests, four reactors, and PER_CHUNK dispatch. Set the
         corresponding KVIKIO_* environment variable to override any value.
     --s3-reader-mode kvikio|kvikio-cache|buffered|buffered-cache
         Select the GPU reader while retaining the isolated direct-receive

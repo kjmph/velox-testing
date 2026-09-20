@@ -105,6 +105,7 @@ assert_occurs_before() {
 }
 
 unset KVIKIO_REMOTE_IO_BACKEND \
+  KVIKIO_REMOTE_ADAPTIVE_TCP_MSS \
   KVIKIO_REMOTE_DIRECT_RECEIVE \
   KVIKIO_TASK_SIZE \
   KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS \
@@ -115,22 +116,27 @@ apply_s3_direct_receive_kvikio_defaults
   fail 'default KvikIO remote backend is not MULTI_POLL'
 [[ ${KVIKIO_REMOTE_DIRECT_RECEIVE} == REQUIRE ]] ||
   fail 'default KvikIO direct-receive mode is not REQUIRE'
-[[ ${KVIKIO_TASK_SIZE} == 16777216 ]] ||
-  fail 'default KvikIO task size is not 16 MiB'
-[[ ${KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS} == 64 ]] ||
-  fail 'default KvikIO request concurrency is not 64'
+[[ ${KVIKIO_TASK_SIZE} == 33554432 ]] ||
+  fail 'default KvikIO task size is not 32 MiB'
+[[ ${KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS} == 128 ]] ||
+  fail 'default KvikIO request concurrency is not 128'
+[[ ! -v KVIKIO_REMOTE_ADAPTIVE_TCP_MSS ]] ||
+  fail 'experimental adaptive TCP MSS must not be implicitly enabled'
 [[ ${KVIKIO_REMOTE_IO_NUM_REACTORS} == 4 ]] ||
   fail 'default KvikIO reactor count is not four'
 [[ ${KVIKIO_REMOTE_IO_REACTOR_DISPATCH} == PER_CHUNK ]] ||
   fail 'default KvikIO reactor dispatch is not PER_CHUNK'
 
 export KVIKIO_REMOTE_IO_BACKEND=override-backend
+export KVIKIO_REMOTE_ADAPTIVE_TCP_MSS=ON
 export KVIKIO_REMOTE_DIRECT_RECEIVE=override-direct-receive
 export KVIKIO_TASK_SIZE=override-task-size
 export KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS=override-request-limit
 export KVIKIO_REMOTE_IO_NUM_REACTORS=override-reactors
 export KVIKIO_REMOTE_IO_REACTOR_DISPATCH=override-dispatch
 apply_s3_direct_receive_kvikio_defaults
+[[ ${KVIKIO_REMOTE_ADAPTIVE_TCP_MSS} == ON ]] ||
+  fail 'explicit adaptive TCP MSS policy was overwritten'
 [[ ${KVIKIO_REMOTE_IO_BACKEND} == override-backend ]] ||
   fail 'explicit KvikIO remote backend was overwritten'
 [[ ${KVIKIO_REMOTE_DIRECT_RECEIVE} == override-direct-receive ]] ||
@@ -144,6 +150,7 @@ apply_s3_direct_receive_kvikio_defaults
 [[ ${KVIKIO_REMOTE_IO_REACTOR_DISPATCH} == override-dispatch ]] ||
   fail 'explicit KvikIO reactor dispatch was overwritten'
 unset KVIKIO_REMOTE_IO_BACKEND \
+  KVIKIO_REMOTE_ADAPTIVE_TCP_MSS \
   KVIKIO_REMOTE_DIRECT_RECEIVE \
   KVIKIO_TASK_SIZE \
   KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS \
@@ -656,6 +663,7 @@ export AWS_EC2_METADATA_SERVICE_ENDPOINT='http://sentinel-imds-must-not-be-rende
 export KVIKIO_REMOTE_IO_NUM_REACTORS='SENTINEL_KVIKIO_VALUE_MUST_NOT_BE_RENDERED'
 export KVIKIO_REMOTE_IO_REACTOR_DISPATCH='SENTINEL_KVIKIO_VALUE_MUST_NOT_BE_RENDERED'
 export KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS='SENTINEL_KVIKIO_VALUE_MUST_NOT_BE_RENDERED'
+export KVIKIO_REMOTE_ADAPTIVE_TCP_MSS='SENTINEL_KVIKIO_VALUE_MUST_NOT_BE_RENDERED'
 export KVIKIO_TASK_SIZE='SENTINEL_KVIKIO_VALUE_MUST_NOT_BE_RENDERED'
 export KVIKIO_REMOTE_DIRECT_RECEIVE='SENTINEL_KVIKIO_VALUE_MUST_NOT_BE_RENDERED'
 
@@ -683,6 +691,7 @@ assert_contains 'KVIKIO_REMOTE_IO_BACKEND:' "${GPU_OVERRIDE}"
 assert_contains 'KVIKIO_REMOTE_IO_NUM_REACTORS:' "${GPU_OVERRIDE}"
 assert_contains 'KVIKIO_REMOTE_IO_REACTOR_DISPATCH:' "${GPU_OVERRIDE}"
 assert_contains 'KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS:' "${GPU_OVERRIDE}"
+assert_contains 'KVIKIO_REMOTE_ADAPTIVE_TCP_MSS:' "${GPU_OVERRIDE}"
 assert_contains 'KVIKIO_TASK_SIZE:' "${GPU_OVERRIDE}"
 assert_contains 'KVIKIO_REMOTE_DIRECT_RECEIVE:' "${GPU_OVERRIDE}"
 assert_contains 'KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE:' "${GPU_OVERRIDE}"
@@ -701,6 +710,7 @@ for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
 done
 for variable in KVIKIO_REMOTE_IO_BACKEND KVIKIO_REMOTE_IO_NUM_REACTORS \
   KVIKIO_REMOTE_IO_REACTOR_DISPATCH KVIKIO_REMOTE_IO_MAX_CONCURRENT_REQUESTS \
+  KVIKIO_REMOTE_ADAPTIVE_TCP_MSS \
   KVIKIO_TASK_SIZE KVIKIO_REMOTE_DIRECT_RECEIVE \
   KVIKIO_REMOTE_DIRECT_RECEIVE_SLOT_SIZE \
   KVIKIO_REMOTE_DIRECT_RECEIVE_MAX_PINNED_BYTES; do
